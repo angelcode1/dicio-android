@@ -50,6 +50,7 @@ interface SttInputDeviceWrapper {
 class SttInputDeviceWrapperImpl(
     @param:ApplicationContext private val appContext: Context,
     dataStore: DataStore<UserSettings>,
+    private val localeManager: LocaleManager,
     private val activityForResultManager: ActivityForResultManager,
 ) : SttInputDeviceWrapper {
     private val scope = CoroutineScope(Dispatchers.Default)
@@ -59,13 +60,11 @@ class SttInputDeviceWrapperImpl(
     private var sttPlaySoundSetting: SttPlaySound
     private var sttInputDevice: SttInputDevice?
 
-    // null means that the user has not enabled any STT input device
     private val _uiState: MutableStateFlow<SttState?> = MutableStateFlow(null)
     override val uiState: StateFlow<SttState?> = _uiState
     private var uiStateJob: Job? = null
 
     init {
-        // Run blocking, because the data store is always available right away.
         val (firstSettings, nextSettingsFlow) = dataStore.data
             .map { Triple(it.inputDevice, it.moonshineModel, it.sttPlaySound) }
             .distinctUntilChangedBlockingFirst()
@@ -106,11 +105,9 @@ class SttInputDeviceWrapperImpl(
         return when (setting) {
             UNRECOGNIZED,
             INPUT_DEVICE_UNSET,
-            // Keep the existing protobuf enum value for backwards-compatible settings migration;
-            // in this fork the old Vosk slot is implemented by Moonshine.
             INPUT_DEVICE_VOSK -> MoonshineInputDevice(appContext, moonshineModelSetting)
             INPUT_DEVICE_EXTERNAL_POPUP ->
-                ExternalPopupInputDevice(appContext, activityForResultManager, null)
+                ExternalPopupInputDevice(appContext, activityForResultManager, localeManager)
             INPUT_DEVICE_NOTHING -> null
         }
     }
@@ -125,9 +122,7 @@ class SttInputDeviceWrapperImpl(
             uiStateJob = scope.launch {
                 newSttInputDevice.uiState.collect {
                     _uiState.emit(it)
-                    if (it == SttState.Listening) {
-                        playSound(R.raw.listening_sound)
-                    }
+                    if (it == SttState.Listening) playSound(R.raw.listening_sound)
                 }
             }
         }
@@ -138,7 +133,7 @@ class SttInputDeviceWrapperImpl(
             .setUsage(
                 when (sttPlaySoundSetting) {
                     SttPlaySound.UNRECOGNIZED,
-                    SttPlaySound.STT_PLAY_SOUND_UNSET -> AudioAttributes.USAGE_NOTIFICATION
+                    SttPlaySound.STT_PLAY_SOUND_UNSET,
                     SttPlaySound.STT_PLAY_SOUND_NOTIFICATION -> AudioAttributes.USAGE_NOTIFICATION
                     SttPlaySound.STT_PLAY_SOUND_ALARM -> AudioAttributes.USAGE_ALARM
                     SttPlaySound.STT_PLAY_SOUND_MEDIA -> AudioAttributes.USAGE_MEDIA
@@ -186,8 +181,9 @@ class SttInputDeviceWrapperModule {
     fun provideInputDeviceWrapper(
         @ApplicationContext appContext: Context,
         dataStore: DataStore<UserSettings>,
+        localeManager: LocaleManager,
         activityForResultManager: ActivityForResultManager,
     ): SttInputDeviceWrapper {
-        return SttInputDeviceWrapperImpl(appContext, dataStore, activityForResultManager)
+        return SttInputDeviceWrapperImpl(appContext, dataStore, localeManager, activityForResultManager)
     }
 }
