@@ -9,7 +9,6 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ColorLens
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Hearing
-import androidx.compose.material.icons.filled.HourglassEmpty
 import androidx.compose.material.icons.filled.InvertColors
 import androidx.compose.material.icons.filled.KeyboardAlt
 import androidx.compose.material.icons.filled.Language
@@ -26,12 +25,12 @@ import androidx.compose.ui.res.stringResource
 import org.stypox.dicio.R
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.Language
+import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SpeechOutputDevice
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.Theme
 import org.stypox.dicio.settings.datastore.WakeDevice
 import org.stypox.dicio.settings.ui.BooleanSetting
-import org.stypox.dicio.settings.ui.IntSetting
 import org.stypox.dicio.settings.ui.ListSetting
 
 
@@ -110,8 +109,8 @@ fun inputDevice() = ListSetting(
     possibleValues = listOf(
         ListSetting.Value(
             value = InputDevice.INPUT_DEVICE_VOSK,
-            name = stringResource(R.string.pref_input_method_vosk),
-            description = stringResource(R.string.pref_input_method_vosk_summary),
+            name = "Moonshine (offline)",
+            description = "Fast on-device streaming recognition for short commands",
             icon = Icons.Default.Mic,
         ),
         ListSetting.Value(
@@ -124,6 +123,27 @@ fun inputDevice() = ListSetting(
             value = InputDevice.INPUT_DEVICE_NOTHING,
             name = stringResource(R.string.pref_input_method_text),
             icon = Icons.Default.KeyboardAlt,
+        ),
+    ),
+)
+
+@Composable
+fun moonshineModel() = ListSetting(
+    title = "Recognition quality",
+    icon = Icons.Default.Mic,
+    description = "Balanced is recommended for Pixel Pro-class phones and driving",
+    possibleValues = listOf(
+        ListSetting.Value(
+            value = MoonshineModel.MOONSHINE_MODEL_BALANCED,
+            name = "Balanced",
+            description = "Small Streaming — better accuracy in cabin and road noise",
+            icon = Icons.Default.Mic,
+        ),
+        ListSetting.Value(
+            value = MoonshineModel.MOONSHINE_MODEL_LITE,
+            name = "Lite",
+            description = "Tiny Streaming — lower CPU and memory use",
+            icon = Icons.Default.Mic,
         ),
     ),
 )
@@ -171,15 +191,6 @@ fun speechOutputDevice() = ListSetting(
             name = stringResource(R.string.pref_speech_output_method_nothing),
         ),
     ),
-)
-
-@Composable
-fun sttSilenceDuration() = IntSetting(
-    title = stringResource(R.string.pref_stt_silence_duration_title),
-    icon = Icons.Default.HourglassEmpty,
-    description = @Composable { stringResource(R.string.pref_stt_silence_duration_description, it) },
-    minimum = 1,
-    maximum = 7,
 )
 
 @Composable

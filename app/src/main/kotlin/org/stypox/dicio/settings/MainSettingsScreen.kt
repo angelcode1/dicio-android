@@ -32,9 +32,9 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import org.stypox.dicio.R
-import org.stypox.dicio.io.input.SttInputDevice
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.Language
+import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SpeechOutputDevice
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.Theme
@@ -104,10 +104,7 @@ private fun MainSettingsScreen(
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             item {
-                dynamicColors().Render(
-                    settings.dynamicColors,
-                    viewModel::setDynamicColors
-                )
+                dynamicColors().Render(settings.dynamicColors, viewModel::setDynamicColors)
             }
         }
         item {
@@ -123,33 +120,37 @@ private fun MainSettingsScreen(
 
         /* INPUT AND OUTPUT METHODS */
         item { SettingsCategoryTitle(stringResource(R.string.pref_io)) }
-        item {
-            inputDevice().Render(
-                when (val inputDevice = settings.inputDevice) {
-                    InputDevice.UNRECOGNIZED,
-                    InputDevice.INPUT_DEVICE_UNSET -> InputDevice.INPUT_DEVICE_VOSK
-                    else -> inputDevice
-                },
-                viewModel::setInputDevice,
-            )
+        val inputDevice = when (val device = settings.inputDevice) {
+            InputDevice.UNRECOGNIZED,
+            InputDevice.INPUT_DEVICE_UNSET -> InputDevice.INPUT_DEVICE_VOSK
+            else -> device
         }
+        item {
+            inputDevice().Render(inputDevice, viewModel::setInputDevice)
+        }
+        if (inputDevice == InputDevice.INPUT_DEVICE_VOSK) {
+            item {
+                moonshineModel().Render(
+                    when (val model = settings.moonshineModel) {
+                        MoonshineModel.UNRECOGNIZED,
+                        MoonshineModel.MOONSHINE_MODEL_UNSET -> MoonshineModel.MOONSHINE_MODEL_BALANCED
+                        else -> model
+                    },
+                    viewModel::setMoonshineModel,
+                )
+            }
+        }
+
         val wakeDevice = when (val device = settings.wakeDevice) {
             WakeDevice.UNRECOGNIZED,
             WakeDevice.WAKE_DEVICE_UNSET -> WakeDevice.WAKE_DEVICE_OWW
             else -> device
         }
-        item {
-            wakeDevice().Render(
-                wakeDevice,
-                viewModel::setWakeDevice,
-            )
-        }
+        item { wakeDevice().Render(wakeDevice, viewModel::setWakeDevice) }
         if (wakeDevice == WakeDevice.WAKE_DEVICE_OWW) {
-            /* OpenWakeWord-specific settings */
             item {
                 val isHeyDicio by viewModel.isHeyDicio.collectAsState(true)
                 if (isHeyDicio) {
-                    // the wake word is "Hey Dicio", so there is no custom model at the moment
                     SettingsItem(
                         modifier = Modifier.clickable { importLauncher.launch(arrayOf("*/*")) },
                         title = stringResource(R.string.pref_wake_custom_import),
@@ -157,7 +158,6 @@ private fun MainSettingsScreen(
                         description = stringResource(R.string.pref_wake_custom_import_summary_oww),
                     )
                 } else {
-                    // a custom model is currently set, give the option to remove it
                     SettingsItem(
                         modifier = Modifier.clickable { viewModel.removeOwwUserWakeFile() },
                         title = stringResource(R.string.pref_wake_custom_delete),
@@ -189,21 +189,9 @@ private fun MainSettingsScreen(
             )
         }
         item {
-            sttSilenceDuration().Render(
-                SttInputDevice.getSttSilenceDurationOrDefault(settings),
-                viewModel::setSttSilenceDuration
-            )
+            sttAutoFinish().Render(settings.autoFinishSttPopup, viewModel::setAutoFinishSttPopup)
         }
-        item {
-            sttAutoFinish().Render(
-                settings.autoFinishSttPopup,
-                viewModel::setAutoFinishSttPopup
-            )
-        }
-
-        item {
-            Spacer(modifier = Modifier.height(8.dp))
-        }
+        item { Spacer(modifier = Modifier.height(8.dp)) }
     }
 }
 
@@ -211,9 +199,7 @@ private fun MainSettingsScreen(
 @Composable
 private fun MainSettingsScreenPreview() {
     AppTheme {
-        Surface(
-            color = MaterialTheme.colorScheme.background
-        ) {
+        Surface(color = MaterialTheme.colorScheme.background) {
             MainSettingsScreen(
                 navigateToSkillSettings = {},
                 viewModel = MainSettingsViewModel(
@@ -230,16 +216,11 @@ private fun MainSettingsScreenPreview() {
 @Composable
 private fun MainSettingsScreenWithTopBarPreview() {
     AppTheme {
-        Surface(
-            color = MaterialTheme.colorScheme.background
-        ) {
+        Surface(color = MaterialTheme.colorScheme.background) {
             MainSettingsScreen(
                 navigationIcon = {
                     IconButton(onClick = {}) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = null,
-                        )
+                        Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
                     }
                 },
                 navigateToSkillSettings = {},

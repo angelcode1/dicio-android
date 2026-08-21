@@ -22,31 +22,23 @@ package org.stypox.dicio.io.input
 import org.stypox.dicio.ui.util.Progress
 
 /**
- * This is almost symmetrical to [org.stypox.dicio.io.input.vosk.VoskState], except that there are
- * no implementation-defined fields. For this reason, if in the future another STT engine will be
- * used, this class and the whole UI layer could be kept the same.
+ * UI-facing state shared by speech-to-text input implementations. Engine-specific objects remain
+ * inside the input device so the rest of Dicio does not depend on a recognizer implementation.
  */
 sealed interface SttState {
     /**
-     * Does not have a counterpart in [org.stypox.dicio.io.input.vosk.VoskState] and should never be
-     * generated directly by a [org.stypox.dicio.io.input.SttInputDevice]. In fact, this is used
-     * directly in the UI layer, since permission checks can only be done there.
+     * Should never be generated directly by a [SttInputDevice]. This is used by the UI layer,
+     * since permission checks can only be done there.
      */
     data object NoMicrophonePermission : SttState
 
-    /**
-     * The STT engine has not been initialized yet (waiting for a locale to be available)
-     */
+    /** The STT engine has not been initialized yet. */
     data object NotInitialized : SttState
 
-    /**
-     * The STT engine cannot be made available, e.g. because the current language is not supported
-     */
+    /** The STT engine cannot be made available for the current configuration. */
     data object NotAvailable : SttState
 
-    /**
-     * The model is not present on disk, neither in unzipped and in zipped form.
-     */
+    /** The model is not present on disk. */
     data object NotDownloaded : SttState
 
     data class Downloading(
@@ -59,9 +51,7 @@ sealed interface SttState {
 
     data object Downloaded : SttState
 
-    /**
-     * Vosk models are distributed in Zip files that need unzipping to be ready.
-     */
+    /** Some model providers may require an extraction step after download. */
     data class Unzipping(
         val progress: Progress,
     ) : SttState
@@ -70,14 +60,12 @@ sealed interface SttState {
         val throwable: Throwable
     ) : SttState
 
-    /**
-     * The model is present on disk, but was not loaded in RAM yet.
-     */
+    /** The model is available on disk, but is not loaded in memory yet. */
     data object NotLoaded : SttState
 
     /**
-     * The model is being loaded, and [thenStartListening] indicates whether, once loading is
-     * finished, the STT should start listening right away.
+     * The model is being loaded, and [thenStartListening] indicates whether listening should begin
+     * immediately once loading finishes.
      */
     data class Loading(
         val thenStartListening: Boolean
@@ -87,21 +75,15 @@ sealed interface SttState {
         val throwable: Throwable
     ) : SttState
 
-    /**
-     * The model is ready in RAM, and can start listening at any time.
-     */
+    /** The model is ready in memory. */
     data object Loaded : SttState
 
-    /**
-     * The model is listening.
-     */
+    /** The model is actively listening. */
     data object Listening : SttState
 
     /**
-     * An external Android app has been asked to listen (e.g. through
-     * `RecognizerIntent.ACTION_RECOGNIZE_SPEECH`), and may be listening but we don't know for
-     * sure (maybe it's still loading). Therefore in the UI a "Waiting..." message should be shown
-     * instead of "Listening..." to not confuse the user.
+     * An external Android app has been asked to listen and may still be loading. The UI therefore
+     * displays a waiting state rather than claiming that recording has started.
      */
     data object WaitingForResult : SttState
 }

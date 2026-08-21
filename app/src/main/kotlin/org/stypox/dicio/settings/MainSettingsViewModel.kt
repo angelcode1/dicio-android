@@ -13,6 +13,7 @@ import org.stypox.dicio.di.WakeDeviceWrapper
 import org.stypox.dicio.io.wake.oww.OpenWakeWordDevice
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.Language
+import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SpeechOutputDevice
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.Theme
@@ -65,14 +66,14 @@ class MainSettingsViewModel @Inject constructor(
         updateData { it.setDynamicColors(value) }
     fun setInputDevice(value: InputDevice) =
         updateData { it.setInputDevice(value) }
+    fun setMoonshineModel(value: MoonshineModel) =
+        updateData { it.setMoonshineModel(value) }
     fun setWakeDevice(value: WakeDevice) =
         updateData { it.setWakeDevice(value) }
     fun setSpeechOutputDevice(value: SpeechOutputDevice) =
         updateData { it.setSpeechOutputDevice(value) }
     fun setSttPlaySound(value: SttPlaySound) =
         updateData { it.setSttPlaySound(value) }
-    fun setSttSilenceDuration(value: Int) =
-        updateData { it.setSttSilenceDuration(value) }
     fun setAutoFinishSttPopup(value: Boolean) =
         updateData { it.setAutoFinishSttPopup(value) }
 }

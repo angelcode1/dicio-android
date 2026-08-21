@@ -31,7 +31,8 @@ android {
 
     defaultConfig {
         applicationId = "org.stypox.dicio"
-        minSdk = libs.versions.minSdk.get().toInt()
+        // Moonshine's Android runtime requires API 26+. This fork targets Pixel-class devices.
+        minSdk = 26
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 18
         versionName = "4.1"
@@ -39,8 +40,10 @@ android {
 
         vectorDrawables.useSupportLibrary = true
 
+        // Keep the driving-focused Pixel build small: Moonshine ships native code and the target
+        // devices are arm64. Avoid packaging legacy/emulator ABIs in release artifacts.
         ndk {
-            abiFilters += arrayOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            abiFilters += "arm64-v8a"
         }
     }
 
@@ -173,9 +176,9 @@ dependencies {
     implementation(libs.kotlin.serialization)
     implementation(libs.navigation)
 
-    // Vosk
-    implementation(libs.jna) { artifact { type = "aar" } }
-    implementation(libs.vosk.android)
+    // On-device streaming speech recognition. Model weights are downloaded on first use and are
+    // not bundled in the APK; only the selected Lite or Balanced model is requested.
+    implementation("ai.moonshine:moonshine-voice:0.1.3")
 
     // LiteRT / Tensorflow Lite
     implementation(libs.litert)
