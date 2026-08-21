@@ -46,8 +46,10 @@ class MoonshineInputDevice(
     private var pendingListener: ((InputEvent) -> Unit)? = null
     private var activeListener: ((InputEvent) -> Unit)? = null
     private val finalDispatched = AtomicBoolean(false)
+    private val destroyed = AtomicBoolean(false)
 
     override fun tryLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?): Boolean {
+        if (destroyed.get()) return false
         when (_uiState.value) {
             SttState.NotLoaded,
             is SttState.ErrorLoading -> load(thenStartListeningEventListener)
@@ -64,6 +66,7 @@ class MoonshineInputDevice(
     }
 
     override fun onClick(eventListener: (InputEvent) -> Unit) {
+        if (destroyed.get()) return
         when (_uiState.value) {
             SttState.NotLoaded,
             is SttState.ErrorLoading -> load(eventListener)
@@ -78,7 +81,7 @@ class MoonshineInputDevice(
     }
 
     private fun load(thenStartListeningEventListener: ((InputEvent) -> Unit)?) {
-        if (loadJob?.isActive == true) return
+        if (destroyed.get() || loadJob?.isActive == true) return
         synchronized(lock) { pendingListener = thenStartListeningEventListener }
         _uiState.value = SttState.Loading(thenStartListeningEventListener != null)
 
@@ -89,10 +92,19 @@ class MoonshineInputDevice(
                     .language("en")
                     .modelArch(modelArch)
                     .callbacksOnMainThread(false)
-                    .onText(::onPartialText)
+                    .onText { text -> onPartialText(text) }
                     .onLine { line -> onCompletedLine(line.text ?: "") }
-                    .onError(::onRuntimeError)
+                    .onError { error -> onRuntimeError(error) }
                 createdMic.load()
+
+                // load() is blocking and cannot be cancelled while a model download is in flight.
+                // If settings changed or this device was destroyed in the meantime, release the
+                // completed recognizer instead of publishing a stale instance.
+                if (destroyed.get()) {
+                    createdMic.close()
+                    return@launch
+                }
+
                 mic = createdMic
                 _uiState.value = SttState.Loaded
 
@@ -105,12 +117,15 @@ class MoonshineInputDevice(
                 createdMic?.close()
                 mic = null
                 synchronized(lock) { pendingListener = null }
-                _uiState.value = SttState.ErrorLoading(t)
+                if (!destroyed.get()) {
+                    _uiState.value = SttState.ErrorLoading(t)
+                }
             }
         }
     }
 
     private fun startListening(eventListener: (InputEvent) -> Unit) {
+        if (destroyed.get()) return
         val currentMic = mic ?: return
         synchronized(lock) {
             activeListener = eventListener
@@ -119,10 +134,11 @@ class MoonshineInputDevice(
         scope.launch(Dispatchers.IO) {
             try {
                 currentMic.start()
-                // The model may have been stopped/destroyed while start() was blocking.
                 synchronized(lock) {
-                    if (activeListener === eventListener) {
+                    if (!destroyed.get() && activeListener === eventListener) {
                         _uiState.value = SttState.Listening
+                    } else {
+                        currentMic.stop()
                     }
                 }
             } catch (t: Throwable) {
@@ -132,6 +148,7 @@ class MoonshineInputDevice(
     }
 
     private fun onPartialText(text: String) {
+        if (destroyed.get()) return
         val cleaned = text.trim()
         if (cleaned.isEmpty() || finalDispatched.get()) return
         val listener = synchronized(lock) { activeListener }
@@ -139,7 +156,7 @@ class MoonshineInputDevice(
     }
 
     private fun onCompletedLine(text: String) {
-        if (!finalDispatched.compareAndSet(false, true)) return
+        if (destroyed.get() || !finalDispatched.compareAndSet(false, true)) return
         val listener = synchronized(lock) {
             activeListener.also { activeListener = null }
         } ?: return
@@ -158,6 +175,7 @@ class MoonshineInputDevice(
     }
 
     private fun onRuntimeError(error: Throwable) {
+        if (destroyed.get()) return
         Log.e(TAG, "Moonshine recognition failed", error)
         val listener = synchronized(lock) {
             activeListener.also { activeListener = null }
@@ -169,7 +187,7 @@ class MoonshineInputDevice(
     }
 
     override fun stopListening() {
-        if (_uiState.value != SttState.Listening) return
+        if (destroyed.get() || _uiState.value != SttState.Listening) return
         finalDispatched.set(true)
         val listener = synchronized(lock) {
             activeListener.also { activeListener = null }
@@ -180,6 +198,7 @@ class MoonshineInputDevice(
     }
 
     override suspend fun destroy() {
+        if (!destroyed.compareAndSet(false, true)) return
         synchronized(lock) {
             pendingListener = null
             activeListener = null
