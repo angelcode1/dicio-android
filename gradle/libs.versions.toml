@@ -20,7 +20,6 @@ jacksonDataformatYaml = "2.20.0"
 jacksonModuleKotlin = "2.20.0"
 java = "21"
 jgit = "7.3.0.202506031305-r"
-jna = "5.18.1"
 jsoup = "1.21.2"
 kotest = "6.0.3"
 kotlin = "2.2.20"
@@ -35,7 +34,6 @@ unbescape = "1.1.6.RELEASE"
 # used by the UnicodeCldrLanguagesTask plugin as the git commit of the
 # https://github.com/unicode-org/cldr repo to use as a source of data
 unicodeCldrGitCommit = "41283df11cce01751c29c400a8f94d1d8687210d"
-voskAndroid = "0.3.70"
 litert = "1.4.0" # cannot update to 2.0.0 as its minSdk is 23
 permissionFlow = "2.1.0"
 minSdk = "21"
@@ -72,7 +70,6 @@ hilt-navigation-compose = { module = "androidx.hilt:hilt-navigation-compose", ve
 jackson-dataformat-yaml = { module = "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml", version.ref = "jacksonDataformatYaml" }
 jackson-module-kotlin = { module = "com.fasterxml.jackson.module:jackson-module-kotlin", version.ref = "jacksonModuleKotlin" }
 jgit = { module = "org.eclipse.jgit:org.eclipse.jgit", version.ref = "jgit" }
-jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 jsoup = { module = "org.jsoup:jsoup", version.ref = "jsoup" }
 kotest-property = { module = "io.kotest:kotest-property", version.ref = "kotest" }
 kotest-assertions-core = { module = "io.kotest:kotest-assertions-core", version.ref = "kotest" }
@@ -92,7 +89,6 @@ test-rules = { module = "androidx.test:rules", version.ref = "androidxTest" }
 test-runner = { module = "androidx.test:runner", version.ref = "androidxTest" }
 test-ui-automator = { module = "androidx.test.uiautomator:uiautomator", version.ref = "androidxTestUiAutomator" }
 unbescape = { module = "org.unbescape:unbescape", version.ref = "unbescape" }
-vosk-android = { module = "com.alphacephei:vosk-android", version.ref = "voskAndroid" }
 litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
 permission-flow-android = { module = "dev.shreyaspatil.permission-flow:permission-flow-android", version.ref = "permissionFlow" }
 permission-flow-compose = { module = "dev.shreyaspatil.permission-flow:permission-flow-compose", version.ref = "permissionFlow" }
