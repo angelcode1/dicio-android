@@ -15,6 +15,7 @@ on:
   push:
     branches:
       - main
+      - moonshine-stt
     paths-ignore:
       - 'README.md'
       - 'fastlane/**'
