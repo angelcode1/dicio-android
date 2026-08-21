@@ -17,23 +17,22 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import okhttp3.OkHttpClient
 import org.stypox.dicio.R
 import org.stypox.dicio.io.input.InputEvent
 import org.stypox.dicio.io.input.SttInputDevice
 import org.stypox.dicio.io.input.SttState
 import org.stypox.dicio.io.input.external_popup.ExternalPopupInputDevice
-import org.stypox.dicio.io.input.vosk.VoskInputDevice
+import org.stypox.dicio.io.input.moonshine.MoonshineInputDevice
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_EXTERNAL_POPUP
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_NOTHING
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_UNSET
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_VOSK
 import org.stypox.dicio.settings.datastore.InputDevice.UNRECOGNIZED
+import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.UserSettings
 import org.stypox.dicio.util.distinctUntilChangedBlockingFirst
-import org.stypox.dicio.util.toStateFlowDistinctBlockingFirst
 
 
 interface SttInputDeviceWrapper {
@@ -51,15 +50,13 @@ interface SttInputDeviceWrapper {
 class SttInputDeviceWrapperImpl(
     @param:ApplicationContext private val appContext: Context,
     dataStore: DataStore<UserSettings>,
-    private val localeManager: LocaleManager,
-    private val okHttpClient: OkHttpClient,
     private val activityForResultManager: ActivityForResultManager,
 ) : SttInputDeviceWrapper {
     private val scope = CoroutineScope(Dispatchers.Default)
 
     private var inputDeviceSetting: InputDevice
+    private var moonshineModelSetting: MoonshineModel
     private var sttPlaySoundSetting: SttPlaySound
-    private val silencesBeforeStop: StateFlow<Int>
     private var sttInputDevice: SttInputDevice?
 
     // null means that the user has not enabled any STT input device
@@ -67,36 +64,39 @@ class SttInputDeviceWrapperImpl(
     override val uiState: StateFlow<SttState?> = _uiState
     private var uiStateJob: Job? = null
 
-
     init {
-        // Run blocking, because the data store is always available right away since LocaleManager
-        // also initializes in a blocking way from the same data store.
+        // Run blocking, because the data store is always available right away.
         val (firstSettings, nextSettingsFlow) = dataStore.data
-            .map { Pair(it.inputDevice, it.sttPlaySound) }
+            .map { Triple(it.inputDevice, it.moonshineModel, it.sttPlaySound) }
             .distinctUntilChangedBlockingFirst()
 
         inputDeviceSetting = firstSettings.first
-        sttPlaySoundSetting = firstSettings.second
-        silencesBeforeStop = dataStore.data.map(SttInputDevice::getSttSilenceDurationOrDefault)
-            .toStateFlowDistinctBlockingFirst(scope)
+        moonshineModelSetting = normalizeMoonshineModel(firstSettings.second)
+        sttPlaySoundSetting = firstSettings.third
         sttInputDevice = buildInputDevice(inputDeviceSetting)
-        scope.launch {
-            restartUiStateJob()
-        }
+        scope.launch { restartUiStateJob() }
 
         scope.launch {
-            nextSettingsFlow.collect { (inputDevice, sttPlaySound) ->
+            nextSettingsFlow.collect { (inputDevice, moonshineModel, sttPlaySound) ->
                 sttPlaySoundSetting = sttPlaySound
-                if (inputDeviceSetting != inputDevice) {
+                val normalizedModel = normalizeMoonshineModel(moonshineModel)
+                if (inputDeviceSetting != inputDevice || moonshineModelSetting != normalizedModel) {
+                    inputDeviceSetting = inputDevice
+                    moonshineModelSetting = normalizedModel
                     changeInputDeviceTo(inputDevice)
                 }
             }
         }
     }
 
+    private fun normalizeMoonshineModel(model: MoonshineModel): MoonshineModel = when (model) {
+        MoonshineModel.UNRECOGNIZED,
+        MoonshineModel.MOONSHINE_MODEL_UNSET -> MoonshineModel.MOONSHINE_MODEL_BALANCED
+        else -> model
+    }
+
     private suspend fun changeInputDeviceTo(setting: InputDevice) {
         val prevSttInputDevice = sttInputDevice
-        inputDeviceSetting = setting
         sttInputDevice = buildInputDevice(setting)
         prevSttInputDevice?.destroy()
         restartUiStateJob()
@@ -106,9 +106,11 @@ class SttInputDeviceWrapperImpl(
         return when (setting) {
             UNRECOGNIZED,
             INPUT_DEVICE_UNSET,
-            INPUT_DEVICE_VOSK -> VoskInputDevice(appContext, okHttpClient, localeManager, silencesBeforeStop)
+            // Keep the existing protobuf enum value for backwards-compatible settings migration;
+            // in this fork the old Vosk slot is implemented by Moonshine.
+            INPUT_DEVICE_VOSK -> MoonshineInputDevice(appContext, moonshineModelSetting)
             INPUT_DEVICE_EXTERNAL_POPUP ->
-                ExternalPopupInputDevice(appContext, activityForResultManager, localeManager)
+                ExternalPopupInputDevice(appContext, activityForResultManager, null)
             INPUT_DEVICE_NOTHING -> null
         }
     }
@@ -136,11 +138,11 @@ class SttInputDeviceWrapperImpl(
             .setUsage(
                 when (sttPlaySoundSetting) {
                     SttPlaySound.UNRECOGNIZED,
-                    SttPlaySound.STT_PLAY_SOUND_UNSET,
+                    SttPlaySound.STT_PLAY_SOUND_UNSET -> AudioAttributes.USAGE_NOTIFICATION
                     SttPlaySound.STT_PLAY_SOUND_NOTIFICATION -> AudioAttributes.USAGE_NOTIFICATION
                     SttPlaySound.STT_PLAY_SOUND_ALARM -> AudioAttributes.USAGE_ALARM
                     SttPlaySound.STT_PLAY_SOUND_MEDIA -> AudioAttributes.USAGE_MEDIA
-                    SttPlaySound.STT_PLAY_SOUND_NONE -> return // do not play any sound
+                    SttPlaySound.STT_PLAY_SOUND_NONE -> return
                 }
             )
             .build()
@@ -151,17 +153,16 @@ class SttInputDeviceWrapperImpl(
 
     private fun wrapEventListener(eventListener: (InputEvent) -> Unit): (InputEvent) -> Unit = {
         if (it is InputEvent.None) {
-            scope.launch {
-                playSound(R.raw.listening_no_input_sound)
-            }
+            scope.launch { playSound(R.raw.listening_no_input_sound) }
         }
         eventListener(it)
     }
 
     override fun tryLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?): Boolean {
-        return sttInputDevice?.tryLoad(if (thenStartListeningEventListener != null) {
-            wrapEventListener(thenStartListeningEventListener)
-        } else { null }) ?: false
+        return sttInputDevice?.tryLoad(
+            if (thenStartListeningEventListener != null) wrapEventListener(thenStartListeningEventListener)
+            else null
+        ) ?: false
     }
 
     override fun stopListening() {
@@ -185,12 +186,8 @@ class SttInputDeviceWrapperModule {
     fun provideInputDeviceWrapper(
         @ApplicationContext appContext: Context,
         dataStore: DataStore<UserSettings>,
-        localeManager: LocaleManager,
-        okHttpClient: OkHttpClient,
         activityForResultManager: ActivityForResultManager,
     ): SttInputDeviceWrapper {
-        return SttInputDeviceWrapperImpl(
-            appContext, dataStore, localeManager, okHttpClient, activityForResultManager
-        )
+        return SttInputDeviceWrapperImpl(appContext, dataStore, activityForResultManager)
     }
 }
