@@ -16,6 +16,7 @@ import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
+import java.io.BufferedInputStream
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -25,12 +26,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import org.stypox.dicio.io.input.InputEvent
 import org.stypox.dicio.io.input.SttInputDevice
 import org.stypox.dicio.io.input.SttState
+import org.stypox.dicio.ui.util.Progress
 import org.stypox.dicio.util.FileToDownload
 import org.stypox.dicio.util.downloadBinaryFilesWithPartial
 
@@ -55,11 +58,10 @@ class ParakeetInputDevice(
     private val modelFile = File(modelDir, MODEL_FILE_NAME)
     private val tokensFile = File(modelDir, TOKENS_FILE_NAME)
     private val vadFile = File(modelDir, VAD_FILE_NAME)
-    private val filesToDownload = listOf(
-        FileToDownload(MODEL_URL, modelFile),
-        FileToDownload(TOKENS_URL, tokensFile),
-        FileToDownload(VAD_URL, vadFile),
-    )
+    private val archiveFile = File(modelDir, MODEL_ARCHIVE_FILE_NAME)
+    private val archiveDownload = FileToDownload(MODEL_ARCHIVE_URL, archiveFile)
+    private val vadDownload = FileToDownload(VAD_URL, vadFile)
+    private val filesToDownload = listOf(archiveDownload, vadDownload)
 
     private val _uiState = MutableStateFlow<SttState>(
         if (modelFilesReady()) SttState.NotLoaded else SttState.NotDownloaded
@@ -81,6 +83,7 @@ class ParakeetInputDevice(
             is SttState.ErrorDownloading -> downloadAndLoad(thenStartListeningEventListener)
 
             is SttState.Downloading,
+            is SttState.Unzipping,
             is SttState.Loading -> if (thenStartListeningEventListener != null) {
                 synchronized(lock) { pendingListener = thenStartListeningEventListener }
             }
@@ -108,6 +111,7 @@ class ParakeetInputDevice(
             is SttState.ErrorLoading -> load(eventListener)
 
             is SttState.Downloading,
+            is SttState.Unzipping,
             is SttState.Loading -> synchronized(lock) {
                 // Match Dicio's existing toggle behavior while a recognizer is being prepared.
                 pendingListener = if (pendingListener == null) eventListener else null
@@ -122,11 +126,8 @@ class ParakeetInputDevice(
     private fun downloadAndLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?) {
         if (destroyed.get() || operationsJob?.isActive == true) return
         synchronized(lock) { pendingListener = thenStartListeningEventListener }
-
-        // FileToDownload tracks the URL separately. If a data file disappeared or is clearly
-        // truncated, remove its URL marker too so the shared downloader will fetch it again.
         invalidateBadDownloadMarkers()
-        _uiState.value = SttState.Downloading(org.stypox.dicio.ui.util.Progress.UNKNOWN)
+        _uiState.value = SttState.Downloading(Progress.UNKNOWN)
 
         operationsJob = scope.launch(Dispatchers.IO) {
             try {
@@ -138,18 +139,79 @@ class ParakeetInputDevice(
                     if (!destroyed.get()) _uiState.value = SttState.Downloading(progress)
                 }
 
+                if (archiveFile.isFile) {
+                    if (!destroyed.get()) _uiState.value = SttState.Unzipping(Progress.UNKNOWN)
+                    extractOfficialModelArchive()
+                    if (!archiveFile.delete()) {
+                        Log.w(TAG, "Could not delete extracted Parakeet archive")
+                    }
+                }
+
                 if (!modelFilesReady()) {
                     throw IOException("Downloaded Parakeet model files failed validation")
                 }
-                if (destroyed.get()) return@launch
-
-                _uiState.value = SttState.NotLoaded
-                loadModelsAndMaybeStart()
             } catch (t: Throwable) {
-                Log.e(TAG, "Failed to download Parakeet model", t)
+                Log.e(TAG, "Failed to prepare Parakeet model", t)
+                // A corrupt archive should never be trusted on retry.
+                archiveFile.delete()
+                archiveDownload.lastDownloadedUrlFile.delete()
                 synchronized(lock) { pendingListener = null }
                 if (!destroyed.get()) _uiState.value = SttState.ErrorDownloading(t)
+                return@launch
             }
+
+            if (destroyed.get()) return@launch
+            _uiState.value = SttState.NotLoaded
+            try {
+                loadModelsAndMaybeStart()
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to load Parakeet model", t)
+                releaseModels()
+                synchronized(lock) { pendingListener = null }
+                if (!destroyed.get()) _uiState.value = SttState.ErrorLoading(t)
+            }
+        }
+    }
+
+    private fun extractOfficialModelArchive() {
+        val wanted = mapOf(
+            MODEL_FILE_NAME to modelFile,
+            TOKENS_FILE_NAME to tokensFile,
+        )
+        val temporary = wanted.mapValues { (_, target) -> File(target.parentFile, target.name + ".extracting") }
+        temporary.values.forEach(File::delete)
+        val found = mutableSetOf<String>()
+
+        try {
+            BufferedInputStream(archiveFile.inputStream()).use { input ->
+                BZip2CompressorInputStream(input).use { bzip2 ->
+                    TarArchiveInputStream(bzip2).use { tar ->
+                        while (true) {
+                            val entry = tar.nextEntry ?: break
+                            if (entry.isDirectory) continue
+                            val name = entry.name.substringAfterLast('/')
+                            val output = temporary[name] ?: continue
+                            output.outputStream().buffered().use { tar.copyTo(it) }
+                            found += name
+                        }
+                    }
+                }
+            }
+
+            if (found != wanted.keys) {
+                throw IOException("Parakeet archive did not contain the expected model files")
+            }
+            for ((name, target) in wanted) {
+                val extracted = temporary.getValue(name)
+                if (target.exists() && !target.delete()) {
+                    throw IOException("Could not replace ${target.name}")
+                }
+                if (!extracted.renameTo(target)) {
+                    throw IOException("Could not install ${target.name}")
+                }
+            }
+        } finally {
+            temporary.values.forEach(File::delete)
         }
     }
 
@@ -298,14 +360,24 @@ class ParakeetInputDevice(
             heardSpeech = heardSpeech || localVad.isSpeechDetected()
 
             if (!localVad.empty()) {
-                val segment = localVad.front()
+                decodeAndFinish(localVad.front().samples)
                 localVad.pop()
-                decodeAndFinish(segment.samples)
                 return
             }
 
-            if (!heardSpeech && SystemClock.elapsedRealtime() - startedAt >= NO_SPEECH_TIMEOUT_MS) {
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            if (!heardSpeech && elapsed >= NO_SPEECH_TIMEOUT_MS) {
                 finishListening(InputEvent.None)
+                return
+            }
+            if (elapsed >= MAX_LISTENING_MS) {
+                localVad.flush()
+                if (!localVad.empty()) {
+                    decodeAndFinish(localVad.front().samples)
+                    localVad.pop()
+                } else {
+                    finishListening(InputEvent.None)
+                }
                 return
             }
         }
@@ -354,7 +426,7 @@ class ParakeetInputDevice(
         try {
             if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
         } catch (_: IllegalStateException) {
-            // The recorder can already be stopped while a cancellation races with endpointing.
+            // Cancellation can race with endpointing.
         }
         recorder.release()
     }
@@ -363,19 +435,20 @@ class ParakeetInputDevice(
         return modelFile.length() >= MIN_MODEL_BYTES &&
             tokensFile.length() >= MIN_TOKENS_BYTES &&
             vadFile.length() >= MIN_VAD_BYTES &&
-            filesToDownload.none(FileToDownload::needsToBeDownloaded)
+            !archiveDownload.needsToBeDownloaded() &&
+            !vadDownload.needsToBeDownloaded()
     }
 
     private fun invalidateBadDownloadMarkers() {
-        fun invalidateIfBad(fileToDownload: FileToDownload, minimumBytes: Long) {
-            if (fileToDownload.file.length() < minimumBytes) {
-                fileToDownload.file.delete()
-                fileToDownload.lastDownloadedUrlFile.delete()
-            }
+        if (modelFile.length() < MIN_MODEL_BYTES || tokensFile.length() < MIN_TOKENS_BYTES) {
+            modelFile.delete()
+            tokensFile.delete()
+            archiveDownload.lastDownloadedUrlFile.delete()
         }
-        invalidateIfBad(filesToDownload[0], MIN_MODEL_BYTES)
-        invalidateIfBad(filesToDownload[1], MIN_TOKENS_BYTES)
-        invalidateIfBad(filesToDownload[2], MIN_VAD_BYTES)
+        if (vadFile.length() < MIN_VAD_BYTES) {
+            vadFile.delete()
+            vadDownload.lastDownloadedUrlFile.delete()
+        }
     }
 
     private fun releaseModels() {
@@ -405,11 +478,10 @@ class ParakeetInputDevice(
         private const val MODEL_FILE_NAME = "model.int8.onnx"
         private const val TOKENS_FILE_NAME = "tokens.txt"
         private const val VAD_FILE_NAME = "silero_vad.onnx"
+        private const val MODEL_ARCHIVE_FILE_NAME = "parakeet-110m-int8.tar.bz2"
 
-        private const val MODEL_URL =
-            "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8/resolve/main/model.int8.onnx?download=true"
-        private const val TOKENS_URL =
-            "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8/resolve/main/tokens.txt?download=true"
+        private const val MODEL_ARCHIVE_URL =
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2"
         private const val VAD_URL =
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 
@@ -423,6 +495,7 @@ class ParakeetInputDevice(
         private const val VAD_MIN_SPEECH_SECONDS = 0.15f
         private const val VAD_MAX_SPEECH_SECONDS = 8.0f
         private const val NO_SPEECH_TIMEOUT_MS = 6000L
+        private const val MAX_LISTENING_MS = 12000L
 
         private const val MIN_MODEL_BYTES = 100_000_000L
         private const val MIN_TOKENS_BYTES = 1_000L
