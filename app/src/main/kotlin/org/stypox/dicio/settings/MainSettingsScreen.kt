@@ -34,7 +34,6 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import org.stypox.dicio.R
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.Language
-import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SpeechOutputDevice
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.Theme
@@ -120,25 +119,15 @@ private fun MainSettingsScreen(
 
         /* INPUT AND OUTPUT METHODS */
         item { SettingsCategoryTitle(stringResource(R.string.pref_io)) }
-        val inputDevice = when (val device = settings.inputDevice) {
-            InputDevice.UNRECOGNIZED,
-            InputDevice.INPUT_DEVICE_UNSET -> InputDevice.INPUT_DEVICE_VOSK
-            else -> device
-        }
         item {
-            inputDevice().Render(inputDevice, viewModel::setInputDevice)
-        }
-        if (inputDevice == InputDevice.INPUT_DEVICE_VOSK) {
-            item {
-                moonshineModel().Render(
-                    when (val model = settings.moonshineModel) {
-                        MoonshineModel.UNRECOGNIZED,
-                        MoonshineModel.MOONSHINE_MODEL_UNSET -> MoonshineModel.MOONSHINE_MODEL_BALANCED
-                        else -> model
-                    },
-                    viewModel::setMoonshineModel,
-                )
-            }
+            inputDevice().Render(
+                when (val inputDevice = settings.inputDevice) {
+                    InputDevice.UNRECOGNIZED,
+                    InputDevice.INPUT_DEVICE_UNSET -> InputDevice.INPUT_DEVICE_VOSK
+                    else -> inputDevice
+                },
+                viewModel::setInputDevice,
+            )
         }
 
         val wakeDevice = when (val device = settings.wakeDevice) {

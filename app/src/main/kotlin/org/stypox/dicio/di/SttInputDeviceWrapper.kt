@@ -17,19 +17,19 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
 import org.stypox.dicio.R
 import org.stypox.dicio.io.input.InputEvent
 import org.stypox.dicio.io.input.SttInputDevice
 import org.stypox.dicio.io.input.SttState
 import org.stypox.dicio.io.input.external_popup.ExternalPopupInputDevice
-import org.stypox.dicio.io.input.moonshine.MoonshineInputDevice
+import org.stypox.dicio.io.input.parakeet.ParakeetInputDevice
 import org.stypox.dicio.settings.datastore.InputDevice
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_EXTERNAL_POPUP
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_NOTHING
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_UNSET
 import org.stypox.dicio.settings.datastore.InputDevice.INPUT_DEVICE_VOSK
 import org.stypox.dicio.settings.datastore.InputDevice.UNRECOGNIZED
-import org.stypox.dicio.settings.datastore.MoonshineModel
 import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.UserSettings
 import org.stypox.dicio.util.distinctUntilChangedBlockingFirst
@@ -51,12 +51,12 @@ class SttInputDeviceWrapperImpl(
     @param:ApplicationContext private val appContext: Context,
     dataStore: DataStore<UserSettings>,
     private val localeManager: LocaleManager,
+    private val okHttpClient: OkHttpClient,
     private val activityForResultManager: ActivityForResultManager,
 ) : SttInputDeviceWrapper {
     private val scope = CoroutineScope(Dispatchers.Default)
 
     private var inputDeviceSetting: InputDevice
-    private var moonshineModelSetting: MoonshineModel
     private var sttPlaySoundSetting: SttPlaySound
     private var sttInputDevice: SttInputDevice?
 
@@ -66,32 +66,23 @@ class SttInputDeviceWrapperImpl(
 
     init {
         val (firstSettings, nextSettingsFlow) = dataStore.data
-            .map { Triple(it.inputDevice, it.moonshineModel, it.sttPlaySound) }
+            .map { Pair(it.inputDevice, it.sttPlaySound) }
             .distinctUntilChangedBlockingFirst()
 
         inputDeviceSetting = firstSettings.first
-        moonshineModelSetting = normalizeMoonshineModel(firstSettings.second)
-        sttPlaySoundSetting = firstSettings.third
+        sttPlaySoundSetting = firstSettings.second
         sttInputDevice = buildInputDevice(inputDeviceSetting)
         scope.launch { restartUiStateJob() }
 
         scope.launch {
-            nextSettingsFlow.collect { (inputDevice, moonshineModel, sttPlaySound) ->
+            nextSettingsFlow.collect { (inputDevice, sttPlaySound) ->
                 sttPlaySoundSetting = sttPlaySound
-                val normalizedModel = normalizeMoonshineModel(moonshineModel)
-                if (inputDeviceSetting != inputDevice || moonshineModelSetting != normalizedModel) {
+                if (inputDeviceSetting != inputDevice) {
                     inputDeviceSetting = inputDevice
-                    moonshineModelSetting = normalizedModel
                     changeInputDeviceTo(inputDevice)
                 }
             }
         }
-    }
-
-    private fun normalizeMoonshineModel(model: MoonshineModel): MoonshineModel = when (model) {
-        MoonshineModel.UNRECOGNIZED,
-        MoonshineModel.MOONSHINE_MODEL_UNSET -> MoonshineModel.MOONSHINE_MODEL_BALANCED
-        else -> model
     }
 
     private suspend fun changeInputDeviceTo(setting: InputDevice) {
@@ -105,7 +96,8 @@ class SttInputDeviceWrapperImpl(
         return when (setting) {
             UNRECOGNIZED,
             INPUT_DEVICE_UNSET,
-            INPUT_DEVICE_VOSK -> MoonshineInputDevice(appContext, moonshineModelSetting)
+            // Keep the legacy protobuf enum value so existing installs retain their STT selection.
+            INPUT_DEVICE_VOSK -> ParakeetInputDevice(appContext, okHttpClient)
             INPUT_DEVICE_EXTERNAL_POPUP ->
                 ExternalPopupInputDevice(appContext, activityForResultManager, localeManager)
             INPUT_DEVICE_NOTHING -> null
@@ -182,8 +174,11 @@ class SttInputDeviceWrapperModule {
         @ApplicationContext appContext: Context,
         dataStore: DataStore<UserSettings>,
         localeManager: LocaleManager,
+        okHttpClient: OkHttpClient,
         activityForResultManager: ActivityForResultManager,
     ): SttInputDeviceWrapper {
-        return SttInputDeviceWrapperImpl(appContext, dataStore, localeManager, activityForResultManager)
+        return SttInputDeviceWrapperImpl(
+            appContext, dataStore, localeManager, okHttpClient, activityForResultManager
+        )
     }
 }

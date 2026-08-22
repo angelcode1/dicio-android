@@ -12,7 +12,7 @@ Dicio is a *free and open source* **voice assistant** running on Android. It sup
         <img width="206" alt="Get it on GitHub" src="./meta/get-it-on-github.png">
     </a>
     <a href="https://play.google.com/store/apps/details?id=org.stypox.dicio">
-        <img width="206" alt="Get it on Play Store" src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png">
+        <img width="206" alt="Get it on Play Store" src="https://play.google.com/intl/en_us/badges/static/images/badge/en_badge_web_generic.png">
     </a>
 </p>
 
@@ -46,7 +46,9 @@ Currently Dicio answers questions about:
 
 ## Speech to text
 
-Dicio uses [Vosk](https://github.com/alphacep/vosk-api/) as its speech to text (`STT`) engine. In order to be able to run on every phone small models are employed, weighing `~50MB`. The download from [here](https://alphacephei.com/vosk/models) starts automatically whenever needed, so the app language can be changed seamlessly.
+This fork uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the English **Parakeet TDT-CTC 110M INT8** model for built-in offline speech recognition. It is optimized for short assistant commands rather than dictation. The model is about `126 MB` and is downloaded on first use instead of being bundled in the APK. [Silero VAD](https://github.com/snakers4/silero-vad) is used for speech endpointing before the final command is decoded.
+
+The built-in Parakeet recognizer is English-only. Dicio's existing external Android speech-recognition input remains available when another recognizer or language is required.
 
 ## Wake Word
 

@@ -20,7 +20,6 @@ pluginManagement {
 
 plugins {
     // need to manually read version catalog because it is not available in settings.gradle.kts
-    // this code is duplicate with the below but there is no way to avoid it...
     fun findInVersionCatalog(versionIdentifier: String): String {
         val regex = "^.*$versionIdentifier *= *\"([^\"]+)\".*$".toRegex()
         return File("gradle/libs.versions.toml")
@@ -36,6 +35,17 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // sherpa-onnx publishes its official Android AAR as a versioned GitHub release asset.
+        ivy {
+            name = "SherpaOnnxRelease"
+            url = uri("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2")
+            patternLayout {
+                artifact("[artifact]-[revision].[ext]")
+            }
+            metadataSources {
+                artifact()
+            }
+        }
     }
 }
 
