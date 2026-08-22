@@ -175,9 +175,10 @@ dependencies {
     implementation(libs.kotlin.serialization)
     implementation(libs.navigation)
 
-    // On-device English STT. The 126 MB Parakeet INT8 model is downloaded on first use rather
-    // than bundled in the APK. The dependency below is only the sherpa-onnx Android runtime.
+    // On-device English STT. Model weights are downloaded from sherpa-onnx's official release on
+    // first use, not bundled in the APK. Commons Compress only unpacks that .tar.bz2 release.
     implementation("com.k2fsa:sherpa-onnx:1.13.2@aar")
+    implementation("org.apache.commons:commons-compress:1.28.0")
 
     // LiteRT / Tensorflow Lite
     implementation(libs.litert)
