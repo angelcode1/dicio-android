@@ -31,7 +31,7 @@ android {
 
     defaultConfig {
         applicationId = "org.stypox.dicio"
-        // Moonshine's Android runtime requires API 26+. This fork targets Pixel-class devices.
+        // This fork targets current Pixel-class devices used as a driving assistant.
         minSdk = 26
         targetSdk = libs.versions.targetSdk.get().toInt()
         versionCode = 18
@@ -40,8 +40,7 @@ android {
 
         vectorDrawables.useSupportLibrary = true
 
-        // Keep the driving-focused Pixel build small: Moonshine ships native code and the target
-        // devices are arm64. Avoid packaging legacy/emulator ABIs in release artifacts.
+        // sherpa-onnx ships native libraries; only keep the ABI used by Pixel-class phones.
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -176,9 +175,9 @@ dependencies {
     implementation(libs.kotlin.serialization)
     implementation(libs.navigation)
 
-    // On-device streaming speech recognition. Model weights are downloaded on first use and are
-    // not bundled in the APK; only the selected Lite or Balanced model is requested.
-    implementation("ai.moonshine:moonshine-voice:0.1.3")
+    // On-device English STT. The 126 MB Parakeet INT8 model is downloaded on first use rather
+    // than bundled in the APK. The dependency below is only the sherpa-onnx Android runtime.
+    implementation("com.k2fsa:sherpa-onnx:1.13.2@aar")
 
     // LiteRT / Tensorflow Lite
     implementation(libs.litert)
