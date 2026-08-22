@@ -323,6 +323,9 @@ class ParakeetInputDevice(
     }
 
     private fun createAudioRecord(): AudioRecord {
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("Microphone permission is not granted")
+        }
         val minBufferBytes = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
