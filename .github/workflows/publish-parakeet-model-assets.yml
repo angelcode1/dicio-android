@@ -1,0 +1,53 @@
+name: Publish Parakeet model assets
+
+on:
+  push:
+    branches:
+      - publish-parakeet-model-assets
+    paths:
+      - .github/workflows/publish-parakeet-model-assets.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download official sherpa model archive
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-all-errors \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2 \
+            -o parakeet.tar.bz2
+          mkdir extracted
+          tar -xjf parakeet.tar.bz2 -C extracted
+          MODEL_DIR=$(find extracted -type f -name model.int8.onnx -printf '%h\n' | head -n1)
+          test -n "$MODEL_DIR"
+          cp "$MODEL_DIR/model.int8.onnx" ./model.int8.onnx
+          cp "$MODEL_DIR/tokens.txt" ./tokens.txt
+          curl -fL --retry 3 --retry-all-errors \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx \
+            -o silero_vad.onnx
+          test $(stat -c%s model.int8.onnx) -gt 100000000
+          test $(stat -c%s tokens.txt) -gt 1000
+          test $(stat -c%s silero_vad.onnx) -gt 100000
+          sha256sum model.int8.onnx tokens.txt silero_vad.onnx | tee SHA256SUMS
+
+      - name: Create release and upload direct-download assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=parakeet-110m-int8-v1
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "Parakeet 110M INT8 model assets" \
+              --notes "Direct-download copies of model.int8.onnx and tokens.txt extracted without modification from sherpa-onnx's official sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2 release, plus sherpa-onnx's official silero_vad.onnx. Provided for this Dicio fork to avoid slow on-device BZip2 extraction. Parakeet model attribution/license remain with NVIDIA/sherpa-onnx upstream."
+          fi
+          gh release upload "$TAG" \
+            model.int8.onnx tokens.txt silero_vad.onnx SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
