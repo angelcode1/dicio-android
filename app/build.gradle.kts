@@ -175,10 +175,9 @@ dependencies {
     implementation(libs.kotlin.serialization)
     implementation(libs.navigation)
 
-    // On-device English STT. Model weights are downloaded from sherpa-onnx's official release on
-    // first use, not bundled in the APK. Commons Compress only unpacks that .tar.bz2 release.
+    // On-device English STT. The model is downloaded directly as its final ONNX/token files on
+    // first use, avoiding slow .tar.bz2 extraction on Android.
     implementation("com.k2fsa:sherpa-onnx:1.13.2@aar")
-    implementation("org.apache.commons:commons-compress:1.28.0")
 
     // LiteRT / Tensorflow Lite
     implementation(libs.litert)
