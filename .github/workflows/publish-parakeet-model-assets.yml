@@ -6,12 +6,18 @@ on:
       - publish-parakeet-model-assets
     paths:
       - .github/workflows/publish-parakeet-model-assets.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-parakeet-model-assets.yml
 
 permissions:
   contents: write
 
 jobs:
   publish:
+    if: github.event_name == 'push' || github.head_ref == 'publish-parakeet-model-assets'
     runs-on: ubuntu-24.04
     steps:
       - name: Download official sherpa model archive
