@@ -8,6 +8,7 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,6 +32,7 @@ import javax.inject.Singleton
 interface WakeDeviceWrapper {
     val state: StateFlow<WakeState?>
     val isHeyDicio: StateFlow<Boolean>
+    suspend fun awaitInitialized()
     fun download()
     fun processFrame(audio16bitPcm: ShortArray): Boolean
     fun frameSize(): Int
@@ -47,6 +49,7 @@ class WakeDeviceWrapperImpl(
 ) : WakeDeviceWrapper {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val deviceLock = Any()
+    private val initialized = CompletableDeferred<Unit>()
 
     private var currentSetting: DataStoreWakeDevice = WAKE_DEVICE_NOTHING
     private var lastFrameHadWrongSize = false
@@ -73,8 +76,15 @@ class WakeDeviceWrapperImpl(
             dataStore.data
                 .map { it.wakeDevice }
                 .distinctUntilChanged()
-                .collect(::changeWakeDeviceTo)
+                .collect { setting ->
+                    changeWakeDeviceTo(setting)
+                    if (!initialized.isCompleted) initialized.complete(Unit)
+                }
         }
+    }
+
+    override suspend fun awaitInitialized() {
+        initialized.await()
     }
 
     private fun changeWakeDeviceTo(setting: DataStoreWakeDevice) {
