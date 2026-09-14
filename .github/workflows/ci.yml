@@ -34,7 +34,6 @@ jobs:
         uses: gradle/actions/wrapper-validation@v5
 
       - name: Create and checkout branch that will be used as app name
-        # push events already checked out the branch
         if: github.event_name == 'pull_request'
         env:
           BRANCH: ${{ github.head_ref }}
@@ -47,10 +46,10 @@ jobs:
           distribution: "temurin"
           cache: 'gradle'
 
-      - name: Build debug APK and run jvm tests
-        run: ./gradlew assembleDebug lintDebug testDebugUnitTest --stacktrace
+      - name: Build debug/release APKs, lint and run JVM tests
+        run: ./gradlew assembleDebug assembleRelease lintDebug testDebugUnitTest --stacktrace
 
-      - name: Upload APK
+      - name: Upload debug APK
         uses: actions/upload-artifact@v6
         with:
           name: app
