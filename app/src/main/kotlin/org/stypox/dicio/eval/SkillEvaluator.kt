@@ -212,6 +212,7 @@ class SkillEvaluatorImpl(
                     interaction.copy(
                         questionsAnswers = interaction.questionsAnswers.toMutableList()
                             .apply { add(questionAnswer) }
+                            .takeLast(MAX_QUESTIONS_PER_INTERACTION)
                     )
                 }
             } else {
@@ -233,6 +234,7 @@ class SkillEvaluatorImpl(
     companion object {
         val TAG = SkillEvaluator::class.simpleName
         private const val MAX_INTERACTIONS = 100
+        private const val MAX_QUESTIONS_PER_INTERACTION = 100
     }
 }
 
