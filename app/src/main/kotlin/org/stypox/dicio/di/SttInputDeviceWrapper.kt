@@ -86,6 +86,8 @@ class SttInputDeviceWrapperImpl(
 
     init {
         scope.launch {
+            // External popup recognizers need the persisted app locale before their first request.
+            localeManager.awaitInitialized()
             dataStore.data
                 .map { Pair(it.inputDevice, it.sttPlaySound) }
                 .distinctUntilChanged()
