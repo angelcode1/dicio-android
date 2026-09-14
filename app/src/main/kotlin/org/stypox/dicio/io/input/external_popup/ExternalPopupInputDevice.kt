@@ -8,11 +8,16 @@ import android.speech.RecognizerIntent
 import android.util.Log
 import androidx.activity.result.ActivityResult
 import dagger.hilt.android.qualifiers.ApplicationContext
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.stypox.dicio.R
 import org.stypox.dicio.di.ActivityForResultManager
@@ -20,9 +25,6 @@ import org.stypox.dicio.di.LocaleManager
 import org.stypox.dicio.io.input.InputEvent
 import org.stypox.dicio.io.input.SttInputDevice
 import org.stypox.dicio.io.input.SttState
-import org.stypox.dicio.util.distinctUntilChangedBlockingFirst
-import java.util.Locale
-
 
 class ExternalPopupInputDevice(
     @param:ApplicationContext val context: Context,
@@ -30,10 +32,9 @@ class ExternalPopupInputDevice(
     localeManager: LocaleManager,
 ) : SttInputDevice {
 
-    private var locale: Locale
-    // unfortunately some apps like "speech recognition and synthesis from google" require
-    // the country to also be specified in the locale, hence this hack (hopefully other apps handle
-    // it well)
+    @Volatile
+    private var locale: Locale = localeManager.locale.value
+
     private val localeWithCountry: Locale
         get() = if (locale.country.isEmpty()) {
             Locale.getAvailableLocales()
@@ -43,38 +44,33 @@ class ExternalPopupInputDevice(
             locale
         }
 
-    private val _state: MutableStateFlow<ExternalPopupState>
-    private val _uiState: MutableStateFlow<SttState>
-    override val uiState: StateFlow<SttState>
+    private val destroyed = AtomicBoolean(false)
+    private val _state = MutableStateFlow(stateFromResolveActivity())
+    private val _uiState = MutableStateFlow(_state.value.toUiState())
+    override val uiState: StateFlow<SttState> = _uiState
 
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     init {
-        // Run blocking, because the locale is always available right away since LocaleManager also
-        // initializes in a blocking way.
-        val (firstLocale, nextLocaleFlow) = localeManager.locale
-            .distinctUntilChangedBlockingFirst()
-        locale = firstLocale
-
-        val initialState = stateFromResolveActivity()
-        _state = MutableStateFlow(initialState)
-        _uiState = MutableStateFlow(initialState.toUiState())
-        uiState = _uiState
-
         scope.launch {
             _state.collect { _uiState.value = it.toUiState() }
         }
 
         scope.launch {
-            // perform initialization again every time the locale changes
-            nextLocaleFlow.collect { newLocale ->
+            // StateFlow already supplies the current locale above. Re-resolve only on later changes,
+            // and never overwrite an in-flight request while waiting for its Activity result.
+            localeManager.locale.drop(1).collect { newLocale ->
                 locale = newLocale
-                _state.emit(stateFromResolveActivity())
+                _state.update { current ->
+                    if (current is ExternalPopupState.WaitingForResult) current
+                    else stateFromResolveActivity()
+                }
             }
         }
     }
 
     override fun tryLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?): Boolean {
+        if (destroyed.get()) return false
         if (thenStartListeningEventListener != null) {
             return startListening(thenStartListeningEventListener)
         }
@@ -85,7 +81,7 @@ class ExternalPopupInputDevice(
     }
 
     override fun stopListening() {
-        // no way to implement
+        // An external recognition Activity owns its recording lifecycle.
     }
 
     override fun onClick(eventListener: (InputEvent) -> Unit) {
@@ -93,15 +89,11 @@ class ExternalPopupInputDevice(
     }
 
     override suspend fun destroy() {
+        if (!destroyed.compareAndSet(false, true)) return
         scope.cancel()
     }
 
     private fun getIntent(): Intent {
-        // Unfortunately the user could choose Dicio itself (starting SttPopupActivity), but there
-        // is no way to avoid this unless we use an Intent.createChooser() with
-        // `EXTRA_EXCLUDE_COMPONENTS`. A chooser, however, wouldn't allow the user to press
-        // "Always"/"Just once", and also wouldn't make it possible to check for availability like
-        // with .resolveIntent() (since the intent always resolves to the choooser).
         return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
@@ -121,64 +113,57 @@ class ExternalPopupInputDevice(
     }
 
     private fun startListening(eventListener: (InputEvent) -> Unit): Boolean {
-        if (_state.compareAndSet(
+        if (destroyed.get()) return false
+
+        val waiting = ExternalPopupState.WaitingForResult(eventListener)
+        while (true) {
+            val current = _state.value
+            when (current) {
+                ExternalPopupState.NotAvailable, is ExternalPopupState.WaitingForResult -> return false
                 ExternalPopupState.Available,
-                ExternalPopupState.WaitingForResult(eventListener)
-        ) || _state.compareAndSet(
-                ExternalPopupState.ErrorStartingActivity(Throwable()),
-                ExternalPopupState.WaitingForResult(eventListener)
-        ) || _state.compareAndSet(
-                ExternalPopupState.ErrorActivityResult(0),
-                ExternalPopupState.WaitingForResult(eventListener)
-        )) {
-            try {
-                activityForResultManager.launch(getIntent(), this::onActivityResult)
-            } catch (e: Throwable) {
-                Log.e(TAG, "Could not start STT activity", e)
-                _state.compareAndSet(
-                    ExternalPopupState.WaitingForResult { },
-                    ExternalPopupState.ErrorStartingActivity(e)
-                )
+                is ExternalPopupState.ErrorStartingActivity,
+                is ExternalPopupState.ErrorActivityResult -> {
+                    if (_state.compareAndSet(current, waiting)) break
+                }
             }
         }
-        return false
+
+        return try {
+            if (activityForResultManager.launch(getIntent(), this::onActivityResult)) {
+                true
+            } else {
+                val error = IllegalStateException("No active Activity is available to launch STT")
+                _state.compareAndSet(waiting, ExternalPopupState.ErrorStartingActivity(error))
+                false
+            }
+        } catch (throwable: Throwable) {
+            Log.e(TAG, "Could not start STT activity", throwable)
+            _state.compareAndSet(waiting, ExternalPopupState.ErrorStartingActivity(throwable))
+            false
+        }
     }
 
     private fun onActivityResult(result: ActivityResult) {
-        // all activity requesters are used just once since the activity might change
+        val waiting = _state.value as? ExternalPopupState.WaitingForResult ?: return
         val results = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
         val confidences = result.data?.getFloatArrayExtra(RecognizerIntent.EXTRA_CONFIDENCE_SCORES)
-        val eventListener = _state.value as? ExternalPopupState.WaitingForResult ?: return
 
         if (result.resultCode == RESULT_OK && !results.isNullOrEmpty()) {
-            // this is not atomic but there is no alternative in Kotlin to compare, update and get
-            // the previous value
-            _state.compareAndSet(
-                ExternalPopupState.WaitingForResult { },
-                ExternalPopupState.Available
-            )
-
+            _state.compareAndSet(waiting, stateFromResolveActivity())
             if (results.size == confidences?.size) {
-                eventListener.listener(InputEvent.Final(results.zip(confidences.map { it })))
+                waiting.listener(InputEvent.Final(results.zip(confidences.toList())))
             } else {
-                eventListener.listener(InputEvent.Final(results.map { Pair(it, 1.0f) }))
+                waiting.listener(InputEvent.Final(results.map { Pair(it, 1.0f) }))
             }
-
         } else if (result.resultCode == RESULT_CANCELED) {
-            _state.compareAndSet(
-                ExternalPopupState.WaitingForResult { },
-                ExternalPopupState.Available
-            )
-
-            eventListener.listener(InputEvent.None)
-
+            _state.compareAndSet(waiting, stateFromResolveActivity())
+            waiting.listener(InputEvent.None)
         } else {
             _state.compareAndSet(
-                ExternalPopupState.WaitingForResult { },
+                waiting,
                 ExternalPopupState.ErrorActivityResult(result.resultCode)
             )
-
-            eventListener.listener(InputEvent.Error(ResultCodeException(result.resultCode)))
+            waiting.listener(InputEvent.Error(ResultCodeException(result.resultCode)))
         }
     }
 

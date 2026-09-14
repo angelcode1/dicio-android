@@ -1,5 +1,7 @@
 package org.stypox.dicio.io.input.stt_service
 
+import android.content.Context
+import android.content.ContextParams
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
@@ -8,26 +10,16 @@ import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import androidx.annotation.RequiresApi
 import dagger.hilt.android.AndroidEntryPoint
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import javax.inject.Inject
 import org.stypox.dicio.di.LocaleManager
 import org.stypox.dicio.di.SttInputDeviceWrapper
 import org.stypox.dicio.io.input.InputEvent
-import java.util.Locale
-import javax.inject.Inject
+import org.stypox.dicio.io.input.SttState
 
-
-// TODO this class is really simple at the moment, but many more things could be implemented, e.g.:
-//  - allowing an SttInputDevice to download/support multiple languages
-//  - handling more EXTRAs, e.g. EXTRA_LANGUAGE, EXTRA_LANGUAGE_PREFERENCE,
-//  EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, EXTRA_LANGUAGE_MODEL, LANGUAGE_MODEL_FREE_FORM,
-//  LANGUAGE_MODEL_WEB_SEARCH, EXTRA_SEGMENTED_SESSION,
-//  EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-//  EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-//  EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, EXTRA_AUDIO_SOURCE, EXTRA_AUDIO_SOURCE_CHANNEL_COUNT,
-//  EXTRA_AUDIO_SOURCE_ENCODING, EXTRA_AUDIO_SOURCE_SAMPLING_RATE, EXTRA_BIASING_STRINGS,
-//  EXTRA_ENABLE_BIASING_DEVICE_CONTEXT
-//  - if the SttInputDevice is already busy (e.g. another service is using it, or another part of
-//  Dicio is using it), that needs to be reported with ERROR_BUSY
 @AndroidEntryPoint
 class SttService : RecognitionService() {
 
@@ -37,91 +29,135 @@ class SttService : RecognitionService() {
     @Inject
     lateinit var localeManager: LocaleManager
 
+    private val sessionActive = AtomicBoolean(false)
+
     override fun onStartListening(recognizerIntent: Intent, listener: Callback) {
+        if (!sessionActive.compareAndSet(false, true)) {
+            logRemoteExceptions { listener.error(SpeechRecognizer.ERROR_RECOGNIZER_BUSY) }
+            return
+        }
+
         val wantedLanguageExtra = recognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE)
-        // "und" is "Undetermined", see https://www.loc.gov/standards/iso639-2/php/code_list.php
         if (wantedLanguageExtra != null && wantedLanguageExtra != "und") {
             val appLanguage = localeManager.locale.value.language
             val wantedLanguage = Locale.forLanguageTag(wantedLanguageExtra).language
             if (appLanguage != wantedLanguage) {
+                sessionActive.set(false)
                 Log.e(TAG, "Unsupported language: app=$appLanguage wanted=$wantedLanguageExtra")
-                // From the javadoc of ERROR_LANGUAGE_UNAVAILABLE: Requested language is supported,
-                // but not available currently (e.g. not downloaded yet).
                 logRemoteExceptions { listener.error(ERROR_LANGUAGE_UNAVAILABLE) }
                 return
             }
         }
 
-        var beginningOfSpeech = true
-        val willStartListening = sttInputDevice.tryLoad { inputEvent ->
+        if (sttInputDevice.uiState.value.let {
+                it == SttState.Listening || it == SttState.WaitingForResult
+            }) {
+            sessionActive.set(false)
+            logRemoteExceptions { listener.error(SpeechRecognizer.ERROR_RECOGNIZER_BUSY) }
+            return
+        }
+
+        var speechStarted = false
+        val eventListener: (InputEvent) -> Unit = { inputEvent ->
             when (inputEvent) {
                 is InputEvent.Error -> {
+                    if (speechStarted) logRemoteExceptions { listener.endOfSpeech() }
+                    sessionActive.set(false)
                     logRemoteExceptions { listener.error(SpeechRecognizer.ERROR_SERVER) }
                 }
 
                 is InputEvent.Final -> {
-                    if (beginningOfSpeech) {
+                    if (!speechStarted) {
                         logRemoteExceptions { listener.beginningOfSpeech() }
-                        beginningOfSpeech = false
+                        speechStarted = true
                     }
-
-                    val results = Bundle()
-                    results.putStringArrayList(
-                        SpeechRecognizer.RESULTS_RECOGNITION,
-                        ArrayList(inputEvent.utterances.map { it.first })
-                    )
-                    results.putFloatArray(
-                        SpeechRecognizer.CONFIDENCE_SCORES,
-                        inputEvent.utterances.map { it.second }.toFloatArray()
-                    )
-
-                    logRemoteExceptions { listener.results(results) }
                     logRemoteExceptions { listener.endOfSpeech() }
+
+                    val results = Bundle().apply {
+                        putStringArrayList(
+                            SpeechRecognizer.RESULTS_RECOGNITION,
+                            ArrayList(inputEvent.utterances.map { it.first })
+                        )
+                        putFloatArray(
+                            SpeechRecognizer.CONFIDENCE_SCORES,
+                            inputEvent.utterances.map { it.second }.toFloatArray()
+                        )
+                    }
+                    sessionActive.set(false)
+                    logRemoteExceptions { listener.results(results) }
                 }
 
                 InputEvent.None -> {
+                    if (speechStarted) logRemoteExceptions { listener.endOfSpeech() }
+                    sessionActive.set(false)
                     logRemoteExceptions { listener.error(SpeechRecognizer.ERROR_SPEECH_TIMEOUT) }
-                    logRemoteExceptions { listener.endOfSpeech() }
                 }
 
                 is InputEvent.Partial -> {
-                    if (beginningOfSpeech) {
+                    if (!speechStarted) {
                         logRemoteExceptions { listener.beginningOfSpeech() }
-                        beginningOfSpeech = false
+                        speechStarted = true
                     }
 
-                    val partResult = Bundle()
-                    partResult.putStringArrayList(
-                        SpeechRecognizer.RESULTS_RECOGNITION,
-                        arrayListOf(inputEvent.utterance)
-                    )
-
+                    val partResult = Bundle().apply {
+                        putStringArrayList(
+                            SpeechRecognizer.RESULTS_RECOGNITION,
+                            arrayListOf(inputEvent.utterance)
+                        )
+                    }
                     logRemoteExceptions { listener.partialResults(partResult) }
                 }
             }
         }
 
+        val recordingContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            createCallerAttributionContext(listener)
+        } else {
+            this
+        }
+        val willStartListening = sttInputDevice.tryLoadWithRecordingContext(
+            recordingContext,
+            eventListener,
+        )
+
         if (!willStartListening) {
-            Log.w(TAG, "Could not start STT recognizer")
-            logRemoteExceptions { listener.error(ERROR_LANGUAGE_UNAVAILABLE) }
+            sessionActive.set(false)
+            val error = if (sttInputDevice.uiState.value.let {
+                    it == SttState.Listening || it == SttState.WaitingForResult
+                }) {
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+            } else {
+                ERROR_LANGUAGE_UNAVAILABLE
+            }
+            Log.w(TAG, "Could not start STT recognizer, error=$error")
+            logRemoteExceptions { listener.error(error) }
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun createCallerAttributionContext(listener: Callback): Context {
+        return createContext(
+            ContextParams.Builder()
+                .setNextAttributionSource(listener.callingAttributionSource)
+                .build()
+        )
+    }
+
     override fun onCancel(listener: Callback) {
-        sttInputDevice.stopListening()
+        if (sessionActive.getAndSet(false)) {
+            sttInputDevice.stopListening()
+        }
     }
 
     override fun onStopListening(listener: Callback) {
-        sttInputDevice.stopListening()
+        if (sessionActive.get()) {
+            sttInputDevice.stopListening()
+        }
     }
 
     companion object {
         val TAG = SttService::class.simpleName
 
-        /**
-         * From the javadoc of [SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE]: Requested language is
-         * supported, but not available currently (e.g. not downloaded yet).
-         */
         val ERROR_LANGUAGE_UNAVAILABLE = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
         } else {
@@ -130,7 +166,7 @@ class SttService : RecognitionService() {
 
         fun logRemoteExceptions(f: () -> Unit) {
             try {
-                return f()
+                f()
             } catch (e: RemoteException) {
                 Log.e(TAG, "Remote exception", e)
             }

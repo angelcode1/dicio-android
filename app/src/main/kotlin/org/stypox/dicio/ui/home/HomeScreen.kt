@@ -11,12 +11,12 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -26,8 +26,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.tooling.preview.PreviewParameter
 import androidx.hilt.navigation.compose.hiltViewModel
 import dev.shreyaspatil.permissionflow.compose.rememberPermissionFlowRequestLauncher
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import org.dicio.skill.context.SkillContext
 import org.dicio.skill.skill.Permission
 import org.dicio.skill.skill.SkillInfo
@@ -50,42 +50,54 @@ import kotlin.math.abs
 fun HomeScreen(
     navigationIcon: @Composable () -> Unit,
 ) {
-    val channel = remember { Channel<Boolean>() }
-    val coroutineScope = rememberCoroutineScope()
+    val pendingPermissionRequest = remember {
+        AtomicReference<CompletableDeferred<Boolean>?>(null)
+    }
     val launcher = rememberPermissionFlowRequestLauncher { isGranted ->
-        coroutineScope.launch {
-            channel.send(isGranted.values.all { it })
-        }
+        pendingPermissionRequest.getAndSet(null)?.complete(isGranted.values.all { it })
     }
     val context = LocalContext.current
 
-    suspend fun requestPermissions(permissions: List<Permission>): Boolean {
-        val nonGrantedSecurePermissions = getNonGrantedSecurePermissions(
+    val permissionRequester: suspend (List<Permission>) -> Boolean = remember(context, launcher) {
+        { permissions ->
+            val nonGrantedSecurePermissions = getNonGrantedSecurePermissions(
                 context,
                 permissions.filterIsInstance<Permission.SecurePermission>()
-        )
-        if (nonGrantedSecurePermissions.isNotEmpty()) {
-            // do not request secure permissions directly, it would be confusing, so ask explicitly
-            // instead
-            return false
+            )
+            if (nonGrantedSecurePermissions.isNotEmpty()) {
+                false
+            } else {
+                val normalPermissions = permissions.filterIsInstance<Permission.NormalPermission>()
+                    .map { it.id }.toTypedArray()
+                if (checkPermissions(context, *normalPermissions)) {
+                    true
+                } else {
+                    val result = CompletableDeferred<Boolean>()
+                    if (!pendingPermissionRequest.compareAndSet(null, result)) {
+                        false
+                    } else {
+                        try {
+                            launcher.launch(normalPermissions)
+                            result.await()
+                        } finally {
+                            pendingPermissionRequest.compareAndSet(result, null)
+                        }
+                    }
+                }
+            }
         }
-
-        val normalPermissions = permissions.filterIsInstance<Permission.NormalPermission>()
-            .map { it.id }.toTypedArray()
-        if (checkPermissions(context, *normalPermissions)) {
-            // permissions already granted
-            return true
-        }
-
-        // some permission is not already granted, need to request it
-        launcher.launch(normalPermissions)
-        return channel.receive()
     }
 
     val viewModel: HomeScreenViewModel = hiltViewModel()
-    // keep assigning permissionRequester at every recomposition because `launcher` changes when
-    // the activity is recreated (no rememberSaveable is available)
-    viewModel.skillEvaluator.permissionRequester = ::requestPermissions
+    DisposableEffect(viewModel.skillEvaluator, permissionRequester) {
+        viewModel.skillEvaluator.permissionRequester = permissionRequester
+        onDispose {
+            pendingPermissionRequest.getAndSet(null)?.cancel()
+            if (viewModel.skillEvaluator.permissionRequester === permissionRequester) {
+                viewModel.skillEvaluator.permissionRequester = { false }
+            }
+        }
+    }
 
     val enabledSkillsInfo = viewModel.skillHandler.enabledSkillsInfo.collectAsState()
     val interactionsState = viewModel.skillEvaluator.state.collectAsState()
@@ -118,10 +130,8 @@ fun HomeScreen(
 @Composable
 fun HomeScreen(
     skillContext: SkillContext,
-    // will be null when skills have not been initialized yet
     skills: List<SkillInfo>?,
     interactionLog: InteractionLog,
-    // if the STT state is null, it means the user disabled the STT
     sttState: SttState?,
     onSttClick: () -> Unit,
     wakeState: WakeState?,
@@ -165,7 +175,6 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            // if the STT state is null, it means the user disabled the STT
             if (sttState != null) {
                 SttFab(
                     state = sttState,
@@ -180,7 +189,9 @@ fun HomeScreen(
 
 @Preview
 @Composable
-private fun HomeScreenPreview(@PreviewParameter(InteractionLogPreviews::class) interactionLog: InteractionLog) {
+private fun HomeScreenPreview(
+    @PreviewParameter(InteractionLogPreviews::class) interactionLog: InteractionLog
+) {
     val sttStatesPreviews = remember { SttStatesPreviews().values.toList() }
     var i by remember { mutableIntStateOf(abs(interactionLog.hashCode())) }
 

@@ -5,15 +5,16 @@ import androidx.datastore.core.DataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.dicio.skill.skill.SkillInfo
 import org.stypox.dicio.di.SkillContextInternal
-import org.stypox.dicio.settings.datastore.UserSettings
 import org.stypox.dicio.eval.SkillHandler
-import org.stypox.dicio.util.toStateFlowDistinctBlockingFirst
-import javax.inject.Inject
-
+import org.stypox.dicio.settings.datastore.UserSettings
 
 @HiltViewModel
 class SkillSettingsViewModel @Inject constructor(
@@ -25,10 +26,13 @@ class SkillSettingsViewModel @Inject constructor(
 
     val skills: List<SkillInfo> get() = skillHandler.allSkillInfoList
 
-    // run blocking because the settings screen cannot start if settings have not been loaded yet
-    val enabledSkills = dataStore.data
+    val enabledSkills: StateFlow<Map<String, Boolean>> = dataStore.data
         .map { it.enabledSkillsMap }
-        .toStateFlowDistinctBlockingFirst(viewModelScope)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = emptyMap(),
+        )
 
     val numberLibraryNotAvailable = skillContext.parserFormatter == null
 

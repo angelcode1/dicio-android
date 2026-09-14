@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.k2fsa.sherpa.onnx.FeatureConfig
@@ -23,7 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -39,17 +42,13 @@ import org.stypox.dicio.util.downloadBinaryFilesWithPartial
 
 /**
  * English command recognizer backed by sherpa-onnx and Parakeet TDT-CTC 110M INT8.
- *
- * The model is deliberately non-streaming: Dicio only needs one accurate final command after a
- * wake word. Silero VAD performs endpointing, then the first completed speech segment is decoded
- * once. This keeps the driving-assistant path deterministic and prevents duplicate commands.
  */
 class ParakeetInputDevice(
     appContext: Context,
     private val okHttpClient: OkHttpClient,
 ) : SttInputDevice {
     private val context = appContext.applicationContext
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val lock = Any()
     private val destroyed = AtomicBoolean(false)
     private val finalDispatched = AtomicBoolean(false)
@@ -71,31 +70,43 @@ class ParakeetInputDevice(
     private var operationsJob: Job? = null
     private var listeningJob: Job? = null
     private var pendingListener: ((InputEvent) -> Unit)? = null
+    private var pendingRecordingContext: Context? = null
     private var activeListener: ((InputEvent) -> Unit)? = null
     private var recognizer: OfflineRecognizer? = null
     private var vad: Vad? = null
     private var audioRecord: AudioRecord? = null
 
     override fun tryLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?): Boolean {
+        return tryLoad(thenStartListeningEventListener, context)
+    }
+
+    fun tryLoad(
+        thenStartListeningEventListener: ((InputEvent) -> Unit)?,
+        recordingContext: Context,
+    ): Boolean {
         if (destroyed.get()) return false
         when (_uiState.value) {
             SttState.NotDownloaded,
-            is SttState.ErrorDownloading -> downloadAndLoad(thenStartListeningEventListener)
+            is SttState.ErrorDownloading ->
+                downloadAndLoad(thenStartListeningEventListener, recordingContext)
 
             is SttState.Downloading,
             is SttState.Unzipping,
             is SttState.Loading -> if (thenStartListeningEventListener != null) {
-                synchronized(lock) { pendingListener = thenStartListeningEventListener }
+                synchronized(lock) {
+                    pendingListener = thenStartListeningEventListener
+                    pendingRecordingContext = recordingContext
+                }
             }
 
             SttState.NotLoaded,
-            is SttState.ErrorLoading -> load(thenStartListeningEventListener)
+            is SttState.ErrorLoading -> load(thenStartListeningEventListener, recordingContext)
 
             SttState.Loaded -> if (thenStartListeningEventListener != null) {
-                startListening(thenStartListeningEventListener)
+                startListening(thenStartListeningEventListener, recordingContext)
             }
 
-            SttState.Listening -> return true
+            SttState.Listening -> return thenStartListeningEventListener == null
             else -> return false
         }
         return true
@@ -105,70 +116,90 @@ class ParakeetInputDevice(
         if (destroyed.get()) return
         when (_uiState.value) {
             SttState.NotDownloaded,
-            is SttState.ErrorDownloading -> downloadAndLoad(eventListener)
+            is SttState.ErrorDownloading -> downloadAndLoad(eventListener, context)
 
             SttState.NotLoaded,
-            is SttState.ErrorLoading -> load(eventListener)
+            is SttState.ErrorLoading -> load(eventListener, context)
 
             is SttState.Downloading,
             is SttState.Unzipping,
             is SttState.Loading -> synchronized(lock) {
-                // Match Dicio's existing toggle behavior while a recognizer is being prepared.
-                pendingListener = if (pendingListener == null) eventListener else null
+                if (pendingListener == null) {
+                    pendingListener = eventListener
+                    pendingRecordingContext = context
+                } else {
+                    pendingListener = null
+                    pendingRecordingContext = null
+                }
             }
 
-            SttState.Loaded -> startListening(eventListener)
+            SttState.Loaded -> startListening(eventListener, context)
             SttState.Listening -> stopListening()
             else -> Unit
         }
     }
 
-    private fun downloadAndLoad(thenStartListeningEventListener: ((InputEvent) -> Unit)?) {
-        if (destroyed.get() || operationsJob?.isActive == true) return
-        synchronized(lock) { pendingListener = thenStartListeningEventListener }
-        invalidateBadDownloadMarkers()
-        _uiState.value = SttState.Downloading(Progress.UNKNOWN)
+    private fun downloadAndLoad(
+        thenStartListeningEventListener: ((InputEvent) -> Unit)?,
+        recordingContext: Context,
+    ) {
+        synchronized(lock) {
+            if (destroyed.get() || operationsJob?.isActive == true) return
+            pendingListener = thenStartListeningEventListener
+            pendingRecordingContext = if (thenStartListeningEventListener != null) recordingContext else null
+            invalidateBadDownloadMarkers()
+            _uiState.value = SttState.Downloading(Progress.UNKNOWN)
 
-        operationsJob = scope.launch(Dispatchers.IO) {
-            try {
-                downloadBinaryFilesWithPartial(
-                    urlsFiles = filesToDownload,
-                    httpClient = okHttpClient,
-                    cacheDir = context.cacheDir,
-                ) { progress ->
-                    if (!destroyed.get()) _uiState.value = SttState.Downloading(progress)
+            operationsJob = scope.launch(Dispatchers.IO) {
+                try {
+                    downloadBinaryFilesWithPartial(
+                        urlsFiles = filesToDownload,
+                        httpClient = okHttpClient,
+                        cacheDir = context.cacheDir,
+                    ) { progress ->
+                        if (!destroyed.get()) _uiState.value = SttState.Downloading(progress)
+                    }
+
+                    if (archiveFile.isFile) {
+                        if (!destroyed.get()) _uiState.value = SttState.Unzipping(Progress.UNKNOWN)
+                        extractOfficialModelArchive()
+                        if (!archiveFile.delete()) {
+                            Log.w(TAG, "Could not delete extracted Parakeet archive")
+                        }
+                    }
+
+                    if (!modelFilesReady()) {
+                        throw IOException("Downloaded Parakeet model files failed validation")
+                    }
+                } catch (throwable: Throwable) {
+                    if (!destroyed.get()) {
+                        Log.e(TAG, "Failed to prepare Parakeet model", throwable)
+                        archiveFile.delete()
+                        archiveDownload.lastDownloadedUrlFile.delete()
+                        synchronized(lock) {
+                            pendingListener = null
+                            pendingRecordingContext = null
+                        }
+                        _uiState.value = SttState.ErrorDownloading(throwable)
+                    }
+                    return@launch
                 }
 
-                if (archiveFile.isFile) {
-                    if (!destroyed.get()) _uiState.value = SttState.Unzipping(Progress.UNKNOWN)
-                    extractOfficialModelArchive()
-                    if (!archiveFile.delete()) {
-                        Log.w(TAG, "Could not delete extracted Parakeet archive")
+                if (destroyed.get()) return@launch
+                _uiState.value = SttState.NotLoaded
+                try {
+                    loadModelsAndMaybeStart()
+                } catch (throwable: Throwable) {
+                    if (!destroyed.get()) {
+                        Log.e(TAG, "Failed to load Parakeet model", throwable)
+                        releaseModels()
+                        synchronized(lock) {
+                            pendingListener = null
+                            pendingRecordingContext = null
+                        }
+                        _uiState.value = SttState.ErrorLoading(throwable)
                     }
                 }
-
-                if (!modelFilesReady()) {
-                    throw IOException("Downloaded Parakeet model files failed validation")
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Failed to prepare Parakeet model", t)
-                // A corrupt archive should never be trusted on retry.
-                archiveFile.delete()
-                archiveDownload.lastDownloadedUrlFile.delete()
-                synchronized(lock) { pendingListener = null }
-                if (!destroyed.get()) _uiState.value = SttState.ErrorDownloading(t)
-                return@launch
-            }
-
-            if (destroyed.get()) return@launch
-            _uiState.value = SttState.NotLoaded
-            try {
-                loadModelsAndMaybeStart()
-            } catch (t: Throwable) {
-                Log.e(TAG, "Failed to load Parakeet model", t)
-                releaseModels()
-                synchronized(lock) { pendingListener = null }
-                if (!destroyed.get()) _uiState.value = SttState.ErrorLoading(t)
             }
         }
     }
@@ -178,7 +209,9 @@ class ParakeetInputDevice(
             MODEL_FILE_NAME to modelFile,
             TOKENS_FILE_NAME to tokensFile,
         )
-        val temporary = wanted.mapValues { (_, target) -> File(target.parentFile, target.name + ".extracting") }
+        val temporary = wanted.mapValues { (_, target) ->
+            File(target.parentFile, target.name + ".extracting")
+        }
         temporary.values.forEach(File::delete)
         val found = mutableSetOf<String>()
 
@@ -215,19 +248,29 @@ class ParakeetInputDevice(
         }
     }
 
-    private fun load(thenStartListeningEventListener: ((InputEvent) -> Unit)?) {
-        if (destroyed.get() || operationsJob?.isActive == true) return
-        synchronized(lock) { pendingListener = thenStartListeningEventListener }
-        _uiState.value = SttState.Loading(thenStartListeningEventListener != null)
-
-        operationsJob = scope.launch(Dispatchers.IO) {
-            try {
-                loadModelsAndMaybeStart()
-            } catch (t: Throwable) {
-                Log.e(TAG, "Failed to load Parakeet model", t)
-                releaseModels()
-                synchronized(lock) { pendingListener = null }
-                if (!destroyed.get()) _uiState.value = SttState.ErrorLoading(t)
+    private fun load(
+        thenStartListeningEventListener: ((InputEvent) -> Unit)?,
+        recordingContext: Context,
+    ) {
+        synchronized(lock) {
+            if (destroyed.get() || operationsJob?.isActive == true) return
+            pendingListener = thenStartListeningEventListener
+            pendingRecordingContext = if (thenStartListeningEventListener != null) recordingContext else null
+            _uiState.value = SttState.Loading(thenStartListeningEventListener != null)
+            operationsJob = scope.launch(Dispatchers.IO) {
+                try {
+                    loadModelsAndMaybeStart()
+                } catch (throwable: Throwable) {
+                    if (!destroyed.get()) {
+                        Log.e(TAG, "Failed to load Parakeet model", throwable)
+                        releaseModels()
+                        synchronized(lock) {
+                            pendingListener = null
+                            pendingRecordingContext = null
+                        }
+                        _uiState.value = SttState.ErrorLoading(throwable)
+                    }
+                }
             }
         }
     }
@@ -236,21 +279,19 @@ class ParakeetInputDevice(
         if (destroyed.get()) return
         _uiState.value = SttState.Loading(synchronized(lock) { pendingListener != null })
 
-        var createdRecognizer: OfflineRecognizer? = null
-        var createdVad: Vad? = null
-        try {
-            createdRecognizer = OfflineRecognizer(
-                config = OfflineRecognizerConfig(
-                    featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = FEATURE_DIM),
-                    modelConfig = OfflineModelConfig(
-                        nemo = OfflineNemoEncDecCtcModelConfig(model = modelFile.absolutePath),
-                        tokens = tokensFile.absolutePath,
-                        numThreads = ASR_THREADS,
-                        provider = "cpu",
-                    ),
+        val newRecognizer = OfflineRecognizer(
+            config = OfflineRecognizerConfig(
+                featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = FEATURE_DIM),
+                modelConfig = OfflineModelConfig(
+                    nemo = OfflineNemoEncDecCtcModelConfig(model = modelFile.absolutePath),
+                    tokens = tokensFile.absolutePath,
+                    numThreads = ASR_THREADS,
+                    provider = "cpu",
                 ),
-            )
-            createdVad = Vad(
+            ),
+        )
+        val newVad = try {
+            Vad(
                 config = VadModelConfig(
                     sileroVadModelConfig = SileroVadModelConfig(
                         model = vadFile.absolutePath,
@@ -265,65 +306,77 @@ class ParakeetInputDevice(
                     provider = "cpu",
                 ),
             )
-
-            if (destroyed.get()) {
-                createdVad.release()
-                createdRecognizer.release()
-                return
-            }
-
-            recognizer = createdRecognizer
-            vad = createdVad
-            _uiState.value = SttState.Loaded
-
-            val listener = synchronized(lock) {
-                pendingListener.also { pendingListener = null }
-            }
-            if (listener != null) startListening(listener)
-        } catch (t: Throwable) {
-            createdVad?.release()
-            createdRecognizer?.release()
-            throw t
+        } catch (throwable: Throwable) {
+            newRecognizer.release()
+            throw throwable
         }
+
+        val committed = synchronized(lock) {
+            if (destroyed.get()) {
+                false
+            } else {
+                recognizer = newRecognizer
+                vad = newVad
+                true
+            }
+        }
+        if (!committed) {
+            newVad.release()
+            newRecognizer.release()
+            return
+        }
+        if (destroyed.get()) return
+
+        _uiState.value = SttState.Loaded
+        val pending = synchronized(lock) {
+            val listener = pendingListener
+            val recordingContext = pendingRecordingContext ?: context
+            pendingListener = null
+            pendingRecordingContext = null
+            Pair(listener, recordingContext)
+        }
+        pending.first?.let { startListening(it, pending.second) }
     }
 
-    private fun startListening(eventListener: (InputEvent) -> Unit) {
-        if (destroyed.get() || recognizer == null || vad == null) return
-        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+    private fun startListening(eventListener: (InputEvent) -> Unit, recordingContext: Context) {
+        if (destroyed.get()) return
+        if (recordingContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             eventListener(InputEvent.Error(SecurityException("Microphone permission is not granted")))
             return
         }
 
         synchronized(lock) {
+            if (destroyed.get() || recognizer == null || vad == null || listeningJob?.isActive == true) {
+                return
+            }
             activeListener = eventListener
             finalDispatched.set(false)
-        }
-        vad?.reset()
-
-        listeningJob = scope.launch(Dispatchers.IO) {
-            try {
-                val recorder = createAudioRecord()
-                synchronized(lock) {
-                    if (destroyed.get() || activeListener !== eventListener) {
-                        recorder.release()
-                        return@launch
+            vad?.reset()
+            listeningJob = scope.launch(Dispatchers.IO) {
+                try {
+                    val recorder = createAudioRecord(recordingContext)
+                    synchronized(lock) {
+                        if (destroyed.get() || activeListener !== eventListener) {
+                            recorder.release()
+                            return@launch
+                        }
+                        audioRecord = recorder
                     }
-                    audioRecord = recorder
-                }
-                recorder.startRecording()
-                _uiState.value = SttState.Listening
-                recordUntilEndpoint(recorder)
-            } catch (t: Throwable) {
-                if (!finalDispatched.get() && !destroyed.get()) {
-                    Log.e(TAG, "Parakeet recognition failed", t)
-                    finishListening(InputEvent.Error(t))
+                    recorder.startRecording()
+                    if (!destroyed.get()) _uiState.value = SttState.Listening
+                    recordUntilEndpoint(recorder)
+                } catch (throwable: Throwable) {
+                    if (!finalDispatched.get() && !destroyed.get()) {
+                        Log.e(TAG, "Parakeet recognition failed", throwable)
+                        finishListening(InputEvent.Error(throwable))
+                    }
                 }
             }
         }
     }
 
-    private fun createAudioRecord(): AudioRecord {
-        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+    private fun createAudioRecord(recordingContext: Context): AudioRecord {
+        if (recordingContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             throw SecurityException("Microphone permission is not granted")
         }
         val minBufferBytes = AudioRecord.getMinBufferSize(
@@ -334,7 +387,7 @@ class ParakeetInputDevice(
         if (minBufferBytes <= 0) {
             throw IllegalStateException("Unsupported 16 kHz mono microphone configuration")
         }
-        return AudioRecord.Builder()
+        val builder = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -344,11 +397,14 @@ class ParakeetInputDevice(
                     .build()
             )
             .setBufferSizeInBytes(maxOf(minBufferBytes, AUDIO_CHUNK_SAMPLES * 2 * 4))
-            .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setContext(recordingContext)
+        }
+        return builder.build()
     }
 
     private fun recordUntilEndpoint(recorder: AudioRecord) {
-        val localVad = vad ?: return
+        val localVad = synchronized(lock) { vad } ?: return
         val buffer = ShortArray(AUDIO_CHUNK_SAMPLES)
         val startedAt = SystemClock.elapsedRealtime()
         var heardSpeech = false
@@ -388,7 +444,8 @@ class ParakeetInputDevice(
 
     private fun decodeAndFinish(samples: FloatArray) {
         stopAndReleaseAudioRecord()
-        val localRecognizer = recognizer ?: return finishListening(InputEvent.None)
+        val localRecognizer = synchronized(lock) { recognizer }
+            ?: return finishListening(InputEvent.None)
         val stream = localRecognizer.createStream()
         val text = try {
             stream.acceptWaveform(samples, SAMPLE_RATE)
@@ -408,7 +465,11 @@ class ParakeetInputDevice(
     private fun finishListening(event: InputEvent) {
         if (!finalDispatched.compareAndSet(false, true)) return
         stopAndReleaseAudioRecord()
-        vad?.reset()
+        if (!destroyed.get()) {
+            synchronized(lock) {
+                if (!destroyed.get()) vad?.reset()
+            }
+        }
         val listener = synchronized(lock) {
             activeListener.also { activeListener = null }
         }
@@ -418,7 +479,7 @@ class ParakeetInputDevice(
 
     override fun stopListening() {
         if (destroyed.get() || _uiState.value != SttState.Listening) return
-        listeningJob?.cancel()
+        synchronized(lock) { listeningJob }?.cancel()
         finishListening(InputEvent.None)
     }
 
@@ -455,22 +516,31 @@ class ParakeetInputDevice(
     }
 
     private fun releaseModels() {
-        vad?.release()
-        vad = null
-        recognizer?.release()
-        recognizer = null
+        val resources = synchronized(lock) {
+            Pair(vad.also { vad = null }, recognizer.also { recognizer = null })
+        }
+        resources.first?.release()
+        resources.second?.release()
     }
 
     override suspend fun destroy() {
         if (!destroyed.compareAndSet(false, true)) return
         synchronized(lock) {
             pendingListener = null
+            pendingRecordingContext = null
             activeListener = null
         }
         finalDispatched.set(true)
-        listeningJob?.cancel()
-        operationsJob?.cancel()
+
+        val listening = synchronized(lock) { listeningJob }
+        listening?.cancel()
+        // Stop the blocking AudioRecord read before waiting for the listening coroutine to exit.
         stopAndReleaseAudioRecord()
+        listening?.join()
+
+        val operation = synchronized(lock) { operationsJob }
+        operation?.cancelAndJoin()
+
         releaseModels()
         scope.cancel()
         _uiState.value = SttState.NotInitialized

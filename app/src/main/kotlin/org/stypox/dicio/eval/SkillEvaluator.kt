@@ -7,6 +7,8 @@ import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -14,6 +16,7 @@ import kotlinx.coroutines.withContext
 import org.dicio.skill.skill.InteractionPlan
 import org.dicio.skill.skill.Permission
 import org.dicio.skill.skill.SkillOutput
+import org.dicio.skill.standard.util.MatchHelper
 import org.stypox.dicio.di.SkillContextInternal
 import org.stypox.dicio.di.SttInputDeviceWrapper
 import org.stypox.dicio.io.graphical.ErrorSkillOutput
@@ -24,7 +27,6 @@ import org.stypox.dicio.ui.home.InteractionLog
 import org.stypox.dicio.ui.home.PendingQuestion
 import org.stypox.dicio.ui.home.QuestionAnswer
 import javax.inject.Singleton
-import org.dicio.skill.standard.util.MatchHelper
 
 interface SkillEvaluator {
     val state: StateFlow<InteractionLog>
@@ -40,7 +42,8 @@ class SkillEvaluatorImpl(
     private val sttInputDevice: SttInputDeviceWrapper,
 ) : SkillEvaluator {
 
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val inputEvents = Channel<InputEvent>(Channel.UNLIMITED)
 
     private val skillRanker: SkillRanker
         get() = skillHandler.skillRanker.value
@@ -53,12 +56,27 @@ class SkillEvaluatorImpl(
     )
     override val state: StateFlow<InteractionLog> = _state
 
-    // must be kept up to date even when the activity is recreated, for this reason it is `var`
+    // Must be kept up to date even when the activity is recreated.
+    @Volatile
     override var permissionRequester: suspend (List<Permission>) -> Boolean = { false }
 
-    override fun processInputEvent(event: InputEvent) {
+    init {
+        // Input events form one conversation state machine. Process them strictly in arrival order
+        // so partial/final events cannot race while mutating SkillRanker, SkillContext or the log.
         scope.launch {
-            suspendProcessInputEvent(event)
+            for (event in inputEvents) {
+                try {
+                    suspendProcessInputEvent(event)
+                } catch (throwable: Throwable) {
+                    addErrorInteractionFromPending(throwable)
+                }
+            }
+        }
+    }
+
+    override fun processInputEvent(event: InputEvent) {
+        if (inputEvents.trySend(event).isFailure) {
+            Log.e(TAG, "Could not enqueue input event: $event")
         }
     }
 
@@ -68,9 +86,20 @@ class SkillEvaluatorImpl(
                 addErrorInteractionFromPending(event.throwable)
             }
             is InputEvent.Final -> {
+                if (event.utterances.isEmpty()) {
+                    addErrorInteractionFromPending(
+                        IllegalArgumentException("Final input event contained no utterances")
+                    )
+                    return
+                }
+
+                // SkillHandler initializes asynchronously from DataStore. Do not accidentally use
+                // its fallback-only bootstrap ranker for a real user request.
+                skillHandler.awaitInitialized()
+
                 _state.value = _state.value.copy(
                     pendingQuestion = PendingQuestion(
-                        userInput = event.utterances[0].first,
+                        userInput = event.utterances.first().first,
                         continuesLastInteraction = skillRanker.hasAnyBatches(),
                         skillBeingEvaluated = null,
                     )
@@ -84,9 +113,8 @@ class SkillEvaluatorImpl(
                 _state.value = _state.value.copy(
                     pendingQuestion = PendingQuestion(
                         userInput = event.utterance,
-                        // the next input can be a continuation of the last interaction only if the
-                        // last skill invocation provided some skill batches (which are the only way
-                        // to continue an interaction/conversation)
+                        // The next input can be a continuation of the last interaction only if the
+                        // last skill invocation provided some skill batches.
                         continuesLastInteraction = skillRanker.hasAnyBatches(),
                         skillBeingEvaluated = null,
                     )
@@ -102,14 +130,13 @@ class SkillEvaluatorImpl(
                 skillRanker.getBest(skillContext, input)?.let { skillWithResult ->
                     Pair(input, skillWithResult)
                 }
-            } ?: Pair(utterances[0], skillRanker.getFallbackSkill(skillContext, utterances[0]))
+            } ?: Pair(utterances.first(), skillRanker.getFallbackSkill(skillContext, utterances.first()))
         } catch (throwable: Throwable) {
             addErrorInteractionFromPending(throwable)
             return
         } finally {
             // standardMatchHelper only needs to be set while calling score() on skills, so once
-            // all matching and scoring is done, free up the memory it uses (which may be
-            // significant since the purpose of MatchHelper is to cache information about the input)
+            // all matching and scoring is done, free up the memory it uses.
             skillContext.standardMatchHelper = null
         }
         val skillInfo = chosenSkill.skill.correspondingSkillInfo
@@ -117,9 +144,6 @@ class SkillEvaluatorImpl(
         _state.value = _state.value.copy(
             pendingQuestion = PendingQuestion(
                 userInput = chosenInput,
-                // the skill ranker would have discarded all batches, if the chosen skill was not
-                // the continuation of the last interaction (since continuing an
-                // interaction/conversation is done through the stack of batches)
                 continuesLastInteraction = skillRanker.hasAnyBatches(),
                 skillBeingEvaluated = skillInfo,
             )
@@ -128,7 +152,6 @@ class SkillEvaluatorImpl(
         try {
             val permissions = skillInfo.neededPermissions
             if (permissions.isNotEmpty() && !permissionRequester(permissions)) {
-                // permissions were not granted, show message
                 addInteractionFromPending(MissingPermissionsSkillOutput(skillInfo))
                 return
             }
@@ -141,23 +164,16 @@ class SkillEvaluatorImpl(
             addInteractionFromPending(output)
             output.getSpeechOutput(skillContext).let {
                 if (it.isNotBlank()) {
-                    withContext (Dispatchers.Main) {
+                    withContext(Dispatchers.Main) {
                         skillContext.speechOutputDevice.speak(it)
                     }
                 }
             }
 
             when (interactionPlan) {
-                InteractionPlan.FinishInteraction -> {
-                    // current conversation has ended, reset to the default batch of skills
-                    skillRanker.removeAllBatches()
-                }
-                is InteractionPlan.FinishSubInteraction -> {
-                    skillRanker.removeTopBatch()
-                }
-                is InteractionPlan.Continue -> {
-                    // nothing to do, just continue with current batches
-                }
+                InteractionPlan.FinishInteraction -> skillRanker.removeAllBatches()
+                is InteractionPlan.FinishSubInteraction -> skillRanker.removeTopBatch()
+                is InteractionPlan.Continue -> Unit
                 is InteractionPlan.StartSubInteraction -> {
                     skillRanker.addBatchToTop(interactionPlan.nextSkills)
                 }
@@ -172,10 +188,8 @@ class SkillEvaluatorImpl(
                     sttInputDevice.tryLoad(this::processInputEvent)
                 }
             }
-
         } catch (throwable: Throwable) {
             addErrorInteractionFromPending(throwable)
-            return
         }
     }
 
@@ -192,28 +206,35 @@ class SkillEvaluatorImpl(
         val pendingSkill = log.pendingQuestion?.skillBeingEvaluated
         val questionAnswer = QuestionAnswer(pendingUserInput, skillOutput)
 
-        _state.value = log.copy(
-            interactions = log.interactions.toMutableList().also { inters ->
-                if (pendingContinuesLastInteraction && inters.isNotEmpty()) {
-                    inters[inters.size - 1] = inters[inters.size - 1].let { i -> i.copy(
-                        questionsAnswers = i.questionsAnswers.toMutableList()
+        val interactions = log.interactions.toMutableList().also { inters ->
+            if (pendingContinuesLastInteraction && inters.isNotEmpty()) {
+                inters[inters.size - 1] = inters[inters.size - 1].let { interaction ->
+                    interaction.copy(
+                        questionsAnswers = interaction.questionsAnswers.toMutableList()
                             .apply { add(questionAnswer) }
-                    ) }
-                } else {
-                    inters.add(
-                        Interaction(
-                            skill = pendingSkill,
-                            questionsAnswers = listOf(questionAnswer)
-                        )
+                            .takeLast(MAX_QUESTIONS_PER_INTERACTION)
                     )
                 }
-            },
+            } else {
+                inters.add(
+                    Interaction(
+                        skill = pendingSkill,
+                        questionsAnswers = listOf(questionAnswer)
+                    )
+                )
+            }
+        }.takeLast(MAX_INTERACTIONS)
+
+        _state.value = log.copy(
+            interactions = interactions,
             pendingQuestion = null,
         )
     }
 
     companion object {
         val TAG = SkillEvaluator::class.simpleName
+        private const val MAX_INTERACTIONS = 100
+        private const val MAX_QUESTIONS_PER_INTERACTION = 100
     }
 }
 
