@@ -71,6 +71,7 @@ class SttInputDeviceWrapperImpl(
 
     private var initialized = false
     private var inputDeviceSetting: InputDevice = INPUT_DEVICE_NOTHING
+    @Volatile
     private var sttPlaySoundSetting: SttPlaySound = SttPlaySound.STT_PLAY_SOUND_NONE
     private var sttInputDevice: SttInputDevice? = null
 
@@ -90,8 +91,10 @@ class SttInputDeviceWrapperImpl(
                 .distinctUntilChanged()
                 .collect { (inputDevice, sttPlaySound) ->
                     sttPlaySoundSetting = sttPlaySound
-                    if (!initialized || inputDeviceSetting != inputDevice) {
-                        inputDeviceSetting = inputDevice
+                    val shouldChange = synchronized(deviceLock) {
+                        !initialized || inputDeviceSetting != inputDevice
+                    }
+                    if (shouldChange) {
                         changeInputDeviceTo(inputDevice)
                     }
 
@@ -116,12 +119,29 @@ class SttInputDeviceWrapperImpl(
 
     private suspend fun changeInputDeviceTo(setting: InputDevice) {
         changeMutex.withLock {
-            val newSttInputDevice = buildInputDevice(setting)
-            val previous = synchronized(deviceLock) {
-                sttInputDevice.also { sttInputDevice = newSttInputDevice }
-            }
-            restartUiStateJob(newSttInputDevice)
-            previous?.destroy()
+            replaceInputDeviceLocked(setting, updateSetting = true)
+        }
+    }
+
+    /** Must be called while holding [changeMutex]. */
+    private suspend fun replaceInputDeviceLocked(setting: InputDevice, updateSetting: Boolean) {
+        val newSttInputDevice = buildInputDevice(setting)
+        val previous = synchronized(deviceLock) {
+            if (updateSetting) inputDeviceSetting = setting
+            sttInputDevice.also { sttInputDevice = newSttInputDevice }
+        }
+        restartUiStateJob(newSttInputDevice)
+        previous?.destroy()
+    }
+
+    private suspend fun reinitializeCurrentInputDevice() {
+        changeMutex.withLock {
+            val setting = synchronized(deviceLock) {
+                if (!initialized || sttInputDevice == null) null else inputDeviceSetting
+            } ?: return@withLock
+            // Read the current setting only after acquiring changeMutex, so a queued settings
+            // update cannot be overwritten by an earlier resource-release request.
+            replaceInputDeviceLocked(setting, updateSetting = false)
         }
     }
 
@@ -242,11 +262,7 @@ class SttInputDeviceWrapperImpl(
     }
 
     override fun reinitializeToReleaseResources() {
-        val setting = synchronized(deviceLock) {
-            if (!initialized || sttInputDevice == null) return
-            inputDeviceSetting
-        }
-        scope.launch { changeInputDeviceTo(setting) }
+        scope.launch { reinitializeCurrentInputDevice() }
     }
 
     private data class PendingInitialLoad(
