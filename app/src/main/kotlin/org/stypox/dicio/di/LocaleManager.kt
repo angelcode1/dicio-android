@@ -12,6 +12,7 @@ import dagger.hilt.components.SingletonComponent
 import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +40,7 @@ class LocaleManager @Inject constructor(
         ConfigurationCompat.getLocales(appContext.resources.configuration)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val initialized = CompletableDeferred<Unit>()
     private val _locale: MutableStateFlow<Locale>
     val locale: StateFlow<Locale>
     private val _sentencesLanguage: MutableStateFlow<String>
@@ -46,8 +48,8 @@ class LocaleManager @Inject constructor(
 
     init {
         // Start immediately from the system language instead of blocking the main thread on
-        // DataStore. If the user selected a different language, the first DataStore emission below
-        // updates these flows and BaseActivity recreates itself with the persisted choice.
+        // DataStore. Consumers that must not act until the persisted language has been applied can
+        // call awaitInitialized().
         val initialResolutionResult = getSentencesLocale(Language.LANGUAGE_SYSTEM)
         _locale = MutableStateFlow(initialResolutionResult.availableLocale)
         locale = _locale
@@ -62,8 +64,13 @@ class LocaleManager @Inject constructor(
                     val resolutionResult = getSentencesLocale(newLanguage)
                     _locale.value = resolutionResult.availableLocale
                     _sentencesLanguage.value = resolutionResult.supportedLocaleString
+                    if (!initialized.isCompleted) initialized.complete(Unit)
                 }
         }
+    }
+
+    suspend fun awaitInitialized() {
+        initialized.await()
     }
 
     private fun getSentencesLocale(language: Language): LocaleUtils.LocaleResolutionResult {
