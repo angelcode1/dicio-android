@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
@@ -24,9 +25,14 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.ContextCompat.getSystemService
 import dagger.hilt.android.AndroidEntryPoint
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import org.stypox.dicio.MainActivity
@@ -35,49 +41,34 @@ import org.stypox.dicio.R
 import org.stypox.dicio.di.SttInputDeviceWrapper
 import org.stypox.dicio.di.WakeDeviceWrapper
 import org.stypox.dicio.eval.SkillEvaluator
-import java.time.Instant
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
-import javax.inject.Inject
 
 @AndroidEntryPoint
 class WakeService : Service() {
 
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Default + job)
-
     private val listening = AtomicBoolean(false)
 
-    @Inject
-    lateinit var skillEvaluator: SkillEvaluator
-    @Inject
-    lateinit var sttInputDevice: SttInputDeviceWrapper
-    @Inject
-    lateinit var wakeDevice: WakeDeviceWrapper
+    @Inject lateinit var skillEvaluator: SkillEvaluator
+    @Inject lateinit var sttInputDevice: SttInputDeviceWrapper
+    @Inject lateinit var wakeDevice: WakeDeviceWrapper
 
     private val handler = Handler(Looper.getMainLooper())
     private val releaseSttResourcesRunnable = Runnable {
         if (MainActivity.isCreated <= 0) {
-            // if the main activity is neither visible nor in the background,
-            // then unload the STT after a while because it would be using resources uselessly
             sttInputDevice.reinitializeToReleaseResources()
         }
     }
 
     private lateinit var notificationManager: NotificationManager
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(this, NotificationManager::class.java)!!
 
         scope.launch {
-            // Recreate the notification so that it says the correct thing (i.e. there is a
-            // different string for the "Hey Dicio" wake word and for a custom one).
-            // Ignore the first one (i.e. the current value), which is handled in onStartCommand.
             wakeDevice.isHeyDicio.drop(1).collect { isHeyDicio ->
                 createForegroundNotification(isHeyDicio)
             }
@@ -92,14 +83,12 @@ class WakeService : Service() {
 
         try {
             createForegroundNotification(wakeDevice.isHeyDicio.value)
-        } catch (t: Throwable) {
-            stopWithMessage("could not create WakeService foreground notification", t)
+        } catch (throwable: Throwable) {
+            stopWithMessage("could not create WakeService foreground notification", throwable)
             return START_NOT_STICKY
         }
 
-        if (listening.getAndSet(true)) {
-            return START_STICKY // if we were already listening, do nothing more
-        }
+        if (listening.getAndSet(true)) return START_STICKY
 
         if (ContextCompat.checkSelfPermission(this, RECORD_AUDIO) != PERMISSION_GRANTED) {
             stopWithMessage("Could not start WakeService: microphone permission not granted")
@@ -109,7 +98,7 @@ class WakeService : Service() {
         when (wakeDevice.state.value) {
             WakeState.NotLoaded,
             WakeState.Loading,
-            WakeState.Loaded -> {}
+            WakeState.Loaded -> Unit
             else -> {
                 stopWithMessage("Could not start WakeService: wake word device not ready")
                 return START_NOT_STICKY
@@ -119,9 +108,9 @@ class WakeService : Service() {
         scope.launch {
             try {
                 listenForWakeWord()
-                stopWithMessage() // exit normally, as the user just stopped the service
-            } catch (t: Throwable) {
-                stopWithMessage("Cannot continue listening for wake word", t)
+                stopWithMessage()
+            } catch (throwable: Throwable) {
+                stopWithMessage("Cannot continue listening for wake word", throwable)
             }
         }
 
@@ -130,6 +119,7 @@ class WakeService : Service() {
 
     override fun onDestroy() {
         listening.set(false)
+        handler.removeCallbacks(releaseSttResourcesRunnable)
         job.cancel()
         wakeDevice.reinitializeToReleaseResources()
         super.onDestroy()
@@ -169,55 +159,93 @@ class WakeService : Service() {
             .setOngoing(true)
             .setShowWhen(false)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(NotificationCompat.Action(
-                R.drawable.ic_stop_circle_white,
-                getString(R.string.stop),
-                PendingIntent.getService(
-                    this,
-                    0,
-                    Intent(this, WakeService::class.java)
-                        .apply { action = ACTION_STOP_WAKE_SERVICE },
-                    PendingIntent.FLAG_IMMUTABLE,
-                ),
-            ))
+            .addAction(
+                NotificationCompat.Action(
+                    R.drawable.ic_stop_circle_white,
+                    getString(R.string.stop),
+                    PendingIntent.getService(
+                        this,
+                        0,
+                        Intent(this, WakeService::class.java)
+                            .apply { action = ACTION_STOP_WAKE_SERVICE },
+                        PendingIntent.FLAG_IMMUTABLE,
+                    ),
+                )
+            )
             .build()
 
         startForeground(FOREGROUND_NOTIFICATION_ID, notification)
     }
 
-    private fun listenForWakeWord() {
-        @SuppressLint("MissingPermission")
-        val ar = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            16000,
+    @SuppressLint("MissingPermission")
+    private fun createAudioRecord(): AudioRecord {
+        val minBufferBytes = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            6400,
         )
+        if (minBufferBytes <= 0) {
+            throw IllegalStateException("Unsupported 16 kHz mono microphone configuration")
+        }
+        return AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBufferBytes, wakeDevice.frameSize() * 2 * 2))
+            .build()
+    }
 
+    private fun readFullFrame(recorder: AudioRecord, audio: ShortArray) {
+        var offset = 0
+        while (offset < audio.size && listening.get()) {
+            val read = recorder.read(
+                audio,
+                offset,
+                audio.size - offset,
+                AudioRecord.READ_BLOCKING,
+            )
+            if (read < 0) throw IOException("AudioRecord.read failed with code $read")
+            if (read == 0) continue
+            offset += read
+        }
+        if (offset != audio.size) throw IOException("Wake-word audio capture stopped mid-frame")
+    }
+
+    private fun listenForWakeWord() {
+        val recorder = createAudioRecord()
         var audio = ShortArray(0)
-        var nextWakeWordAllowed = Instant.MIN
+        var nextWakeWordAllowed = 0L
 
         try {
-            ar.startRecording()
+            recorder.startRecording()
             while (listening.get()) {
-                if (audio.size != wakeDevice.frameSize()) {
-                    audio = ShortArray(wakeDevice.frameSize())
-                }
+                val frameSize = wakeDevice.frameSize()
+                if (frameSize <= 0) throw IOException("Wake-word device has no valid frame size")
+                if (audio.size != frameSize) audio = ShortArray(frameSize)
 
-                ar.read(audio, 0, audio.size)
+                readFullFrame(recorder, audio)
 
+                val now = SystemClock.elapsedRealtime()
                 val wakeWordDetected = wakeDevice.processFrame(audio)
-                if (wakeWordDetected && Instant.now() > nextWakeWordAllowed) {
-                    nextWakeWordAllowed = Instant.now().plusMillis(WAKE_WORD_BACKOFF_MILLIS)
+                if (wakeWordDetected && now >= nextWakeWordAllowed) {
+                    nextWakeWordAllowed = now + WAKE_WORD_BACKOFF_MILLIS
                     onWakeWordDetected()
                 }
 
-                lastHeard.set(Instant.now())
+                lastHeardElapsedRealtime.set(now)
             }
         } finally {
-            ar.stop()
-            ar.release()
+            try {
+                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
+            } catch (_: IllegalStateException) {
+                // The recorder may already have failed/stopped.
+            }
+            recorder.release()
         }
     }
 
@@ -225,28 +253,17 @@ class WakeService : Service() {
         Log.d(TAG, "Wake word detected")
 
         val intent = Intent(this, MainActivity::class.java)
-        intent.setAction(ACTION_WAKE_WORD)
-        intent.setFlags(FLAG_ACTIVITY_NEW_TASK)
+            .setAction(ACTION_WAKE_WORD)
+            .setFlags(FLAG_ACTIVITY_NEW_TASK)
 
-        // Start listening and pass STT events to the skill evaluator.
-        // Note that this works even if the MainActivity is opened later!
         sttInputDevice.tryLoad(skillEvaluator::processInputEvent)
 
-        // Unload the STT after a while because it would be using RAM uselessly
         handler.removeCallbacks(releaseSttResourcesRunnable)
         handler.postDelayed(releaseSttResourcesRunnable, RELEASE_STT_RESOURCES_MILLIS)
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || MainActivity.isInForeground > 0) {
-            // start the activity directly on versions prior to Android 10,
-            // or if the MainActivity is already running in the foreground
             startActivity(intent)
-
         } else {
-            // Android 10+ does not allow starting activities from the background,
-            // so show a full-screen notification instead, which does actually result in starting
-            // the activity from the background if the phone is off and Do Not Disturb is not active
-            // Maybe we could also use the "Display over other apps" permission?
-
             val channel = NotificationChannel(
                 TRIGGERED_NOTIFICATION_CHANNEL_ID,
                 getString(R.string.wake_service_triggered_notification),
@@ -265,8 +282,11 @@ class WakeService : Service() {
             val notification = NotificationCompat.Builder(this, TRIGGERED_NOTIFICATION_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_hearing_white)
                 .setContentTitle(getString(R.string.wake_service_triggered_notification))
-                .setStyle(NotificationCompat.BigTextStyle().bigText(
-                    getString(R.string.wake_service_triggered_notification_summary)))
+                .setStyle(
+                    NotificationCompat.BigTextStyle().bigText(
+                        getString(R.string.wake_service_triggered_notification_summary)
+                    )
+                )
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setFullScreenIntent(pendingIntent, true)
                 .build()
@@ -277,12 +297,6 @@ class WakeService : Service() {
     }
 
     companion object {
-        /**
-         * Starting from Android 11, it is not possible to start a foreground service
-         * that accesses the microphone from a BOOT_COMPLETED broadcast. So we show a
-         * notification instead, which starts the foreground service when clicked.
-         * https://developer.android.com/about/versions/15/behavior-changes-15#fgs-boot-completed
-         */
         @RequiresApi(Build.VERSION_CODES.R)
         fun createNotificationToStartLater(context: Context) {
             val notificationManager = getSystemService(context, NotificationManager::class.java)
@@ -306,8 +320,11 @@ class WakeService : Service() {
             val notification = NotificationCompat.Builder(context, START_NOTIFICATION_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_hearing_white)
                 .setContentTitle(context.getString(R.string.wake_service_start_notification))
-                .setStyle(NotificationCompat.BigTextStyle().bigText(
-                    context.getString(R.string.wake_service_start_notification_summary)))
+                .setStyle(
+                    NotificationCompat.BigTextStyle().bigText(
+                        context.getString(R.string.wake_service_start_notification_summary)
+                    )
+                )
                 .setOngoing(false)
                 .setShowWhen(false)
                 .setAutoCancel(true)
@@ -317,11 +334,6 @@ class WakeService : Service() {
             notificationManager.notify(START_NOTIFICATION_ID, notification)
         }
 
-        /**
-         * Start the service. Call this only from a foreground part of the app (e.g. the main
-         * activity), or from BOOT_COMPLETED only before Android 11. For BOOT_COMPLETED on Android
-         * 11+ use [createNotificationToStartLater] instead.
-         */
         fun start(context: Context) {
             Log.d(TAG, "WakeService.start() called from ${Throwable().stackTrace[1]}")
             val intent = Intent(context, WakeService::class.java)
@@ -330,20 +342,20 @@ class WakeService : Service() {
 
         fun stop(context: Context) {
             try {
-                context.startService(Intent(context, WakeService::class.java)
-                    .apply { action = ACTION_STOP_WAKE_SERVICE })
+                context.startService(
+                    Intent(context, WakeService::class.java)
+                        .apply { action = ACTION_STOP_WAKE_SERVICE }
+                )
             } catch (_: IllegalStateException) {
-                // Must not have been running. No problem with that.
+                // Must not have been running.
             }
         }
 
-        // Consider the service running if it processed any audio data within the past half second.
-        fun isRunning(): Boolean = lastHeard.get()?.isAfter(Instant.now().minusMillis(500)) == true
+        fun isRunning(): Boolean {
+            val last = lastHeardElapsedRealtime.get()
+            return last > 0L && SystemClock.elapsedRealtime() - last < 500L
+        }
 
-        /**
-         * On Android 10+ cancels any notification telling the user that the Dicio wake word was
-         * triggered, which is not needed anymore after the main activity starts.
-         */
         fun cancelTriggeredNotification(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 getSystemService(context, NotificationManager::class.java)
@@ -351,9 +363,10 @@ class WakeService : Service() {
             }
         }
 
-        private val lastHeard = AtomicReference<Instant>()
+        private val lastHeardElapsedRealtime = AtomicLong(0L)
 
         private val TAG = WakeService::class.simpleName
+        private const val SAMPLE_RATE = 16000
         private const val FOREGROUND_NOTIFICATION_CHANNEL_ID =
             "org.stypox.dicio.io.wake.WakeService.FOREGROUND"
         private const val START_NOTIFICATION_CHANNEL_ID =
@@ -366,6 +379,6 @@ class WakeService : Service() {
         private const val WAKE_WORD_BACKOFF_MILLIS = 4000L
         private const val ACTION_STOP_WAKE_SERVICE =
             "org.stypox.dicio.io.wake.WakeService.ACTION_STOP"
-        private const val RELEASE_STT_RESOURCES_MILLIS = 1000L * 60 * 5 // 5 minutes
+        private const val RELEASE_STT_RESOURCES_MILLIS = 1000L * 60 * 5
     }
 }
