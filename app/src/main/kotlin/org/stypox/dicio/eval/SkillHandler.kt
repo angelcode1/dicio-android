@@ -81,11 +81,13 @@ class SkillHandler @Inject constructor(
 
     init {
         scope.launch {
+            // Skills read locale-dependent sections through SkillContext. Wait for the persisted
+            // app language before publishing the first usable ranker.
+            localeManager.awaitInitialized()
             localeManager.locale
                 .combine(dataStore.data) { locale, data -> Pair(locale, data.enabledSkillsMap) }
                 .distinctUntilChanged()
                 .collectLatest { (_, enabledSkills) ->
-                    // Locale is intentionally not read here: skills use the sections locale.
                     val newEnabledSkillsInfo = allSkillInfoList
                         .filter { enabledSkills.getOrDefault(it.id, true) }
                         .mapNotNull { info ->
