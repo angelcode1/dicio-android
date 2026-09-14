@@ -63,7 +63,6 @@ class WakeDeviceWrapperImpl(
     init {
         scope.launch {
             currentDevice.collectLatest { newWakeDevice ->
-                _isHeyDicio.emit(newWakeDevice?.isHeyDicio() ?: true)
                 if (newWakeDevice == null) {
                     _state.emit(null)
                 } else {
@@ -98,8 +97,15 @@ class WakeDeviceWrapperImpl(
     /** Must be called while holding [deviceLock]. */
     private fun replaceWakeDeviceLocked(setting: DataStoreWakeDevice) {
         val previous = currentDevice.value
+        val replacement = buildInputDevice(setting)
         lastFrameHadWrongSize = false
-        currentDevice.value = buildInputDevice(setting)
+
+        // Publish the replacement's current state synchronously before currentDevice wakes the
+        // collector. awaitInitialized() can therefore guarantee that state.value is already valid.
+        _isHeyDicio.value = replacement?.isHeyDicio() ?: true
+        _state.value = replacement?.state?.value
+        currentDevice.value = replacement
+
         // processFrame() uses the same lock, so no inference can still be using previous here.
         previous?.destroy()
     }
