@@ -80,13 +80,18 @@ class WakeDeviceWrapperImpl(
     private fun changeWakeDeviceTo(setting: DataStoreWakeDevice) {
         Log.d(TAG, "changeWakeDeviceTo($setting) called")
         synchronized(deviceLock) {
-            val previous = currentDevice.value
             currentSetting = setting
-            lastFrameHadWrongSize = false
-            currentDevice.value = buildInputDevice(setting)
-            // processFrame() uses the same lock, so no inference can still be using previous here.
-            previous?.destroy()
+            replaceWakeDeviceLocked(setting)
         }
+    }
+
+    /** Must be called while holding [deviceLock]. */
+    private fun replaceWakeDeviceLocked(setting: DataStoreWakeDevice) {
+        val previous = currentDevice.value
+        lastFrameHadWrongSize = false
+        currentDevice.value = buildInputDevice(setting)
+        // processFrame() uses the same lock, so no inference can still be using previous here.
+        previous?.destroy()
     }
 
     private fun buildInputDevice(setting: DataStoreWakeDevice): WakeDevice? {
@@ -128,15 +133,17 @@ class WakeDeviceWrapperImpl(
     }
 
     override fun reinitialize() {
-        val setting = synchronized(deviceLock) { currentSetting }
-        changeWakeDeviceTo(setting)
+        synchronized(deviceLock) {
+            replaceWakeDeviceLocked(currentSetting)
+        }
     }
 
     override fun reinitializeToReleaseResources() {
-        val shouldReinitialize = synchronized(deviceLock) {
-            currentDevice.value?.isOccupyingResources() == true
+        synchronized(deviceLock) {
+            if (currentDevice.value?.isOccupyingResources() == true) {
+                replaceWakeDeviceLocked(currentSetting)
+            }
         }
-        if (shouldReinitialize) reinitialize()
     }
 
     companion object {
