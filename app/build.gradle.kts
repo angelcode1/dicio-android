@@ -16,6 +16,7 @@ plugins {
     alias(libs.plugins.com.android.application)
     alias(libs.plugins.org.jetbrains.kotlin.android)
     alias(libs.plugins.org.jetbrains.kotlin.plugin.compose)
+    alias(libs.plugins.org.jetbrains.kotlin.plugin.parcelize)
     alias(libs.plugins.org.jetbrains.kotlin.plugin.serialization)
     alias(libs.plugins.com.google.devtools.ksp)
     alias(libs.plugins.com.google.dagger.hilt.android)
@@ -82,6 +83,7 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 }
@@ -132,6 +134,9 @@ dependencies {
     implementation(libs.dicio.numbers)
     implementation(project(":skill"))
 
+    // Android/Compose. AppCompat is intentionally kept as an explicit dependency because several
+    // transitive Android integrations rely on its compatibility resources at runtime.
+    implementation(libs.appcompat)
     implementation(libs.activity.compose)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
@@ -167,11 +172,13 @@ dependencies {
     implementation(libs.okhttp)
 
     implementation(libs.coil.compose)
+    implementation(libs.accompanist.drawablepainter)
 
     implementation(libs.permission.flow.android)
     implementation(libs.permission.flow.compose)
 
     implementation(libs.unbescape)
+    implementation(libs.jsoup)
 
     implementation(libs.exp4j)
 

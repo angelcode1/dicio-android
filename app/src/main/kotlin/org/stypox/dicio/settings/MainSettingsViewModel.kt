@@ -6,8 +6,11 @@ import androidx.datastore.core.DataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.stypox.dicio.di.WakeDeviceWrapper
 import org.stypox.dicio.io.wake.oww.OpenWakeWordDevice
@@ -18,8 +21,6 @@ import org.stypox.dicio.settings.datastore.SttPlaySound
 import org.stypox.dicio.settings.datastore.Theme
 import org.stypox.dicio.settings.datastore.UserSettings
 import org.stypox.dicio.settings.datastore.WakeDevice
-import org.stypox.dicio.util.toStateFlowDistinctBlockingFirst
-import javax.inject.Inject
 
 @HiltViewModel
 class MainSettingsViewModel @Inject constructor(
@@ -27,9 +28,13 @@ class MainSettingsViewModel @Inject constructor(
     private val wakeDeviceWrapper: WakeDeviceWrapper?,
     private val dataStore: DataStore<UserSettings>
 ) : AndroidViewModel(application) {
-    // run blocking because the settings screen cannot start if settings have not been loaded yet
-    val settingsState = dataStore.data
-        .toStateFlowDistinctBlockingFirst(viewModelScope)
+    // Render immediately with protobuf defaults, then switch to persisted settings when DataStore
+    // emits. This avoids blocking the UI thread merely to open the settings screen.
+    val settingsState: StateFlow<UserSettings> = dataStore.data.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = UserSettings.getDefaultInstance(),
+    )
 
     private fun updateData(transform: (UserSettings.Builder) -> Unit) {
         viewModelScope.launch {
@@ -57,20 +62,12 @@ class MainSettingsViewModel @Inject constructor(
         }
     }
 
-    fun setLanguage(value: Language) =
-        updateData { it.setLanguage(value) }
-    fun setTheme(value: Theme) =
-        updateData { it.setTheme(value) }
-    fun setDynamicColors(value: Boolean) =
-        updateData { it.setDynamicColors(value) }
-    fun setInputDevice(value: InputDevice) =
-        updateData { it.setInputDevice(value) }
-    fun setWakeDevice(value: WakeDevice) =
-        updateData { it.setWakeDevice(value) }
-    fun setSpeechOutputDevice(value: SpeechOutputDevice) =
-        updateData { it.setSpeechOutputDevice(value) }
-    fun setSttPlaySound(value: SttPlaySound) =
-        updateData { it.setSttPlaySound(value) }
-    fun setAutoFinishSttPopup(value: Boolean) =
-        updateData { it.setAutoFinishSttPopup(value) }
+    fun setLanguage(value: Language) = updateData { it.setLanguage(value) }
+    fun setTheme(value: Theme) = updateData { it.setTheme(value) }
+    fun setDynamicColors(value: Boolean) = updateData { it.setDynamicColors(value) }
+    fun setInputDevice(value: InputDevice) = updateData { it.setInputDevice(value) }
+    fun setWakeDevice(value: WakeDevice) = updateData { it.setWakeDevice(value) }
+    fun setSpeechOutputDevice(value: SpeechOutputDevice) = updateData { it.setSpeechOutputDevice(value) }
+    fun setSttPlaySound(value: SttPlaySound) = updateData { it.setSttPlaySound(value) }
+    fun setAutoFinishSttPopup(value: Boolean) = updateData { it.setAutoFinishSttPopup(value) }
 }
