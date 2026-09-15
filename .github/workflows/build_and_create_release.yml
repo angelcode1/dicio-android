@@ -1,101 +1,218 @@
-name: Build and create release
-on: workflow_dispatch
+name: Build APK / create release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_signed_release:
+        description: Sign the APK and create/update the draft GitHub release (requires SIGNING_* secrets)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Java JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: 21
-          distribution: "temurin"
-          cache: 'gradle'
-
-      - name: Extract version and version code
-        run: |
-          echo "VERSION=$(sed -nE 's~versionName ?= ?\"(.*)\"~\1~p' app/build.gradle.kts | tr -d ' ' )" >> "$GITHUB_ENV"
-          echo "VERSION_CODE=$(sed -nE 's~versionCode ?= ?(.*)~\1~p' app/build.gradle.kts | tr -d ' ' )" >> "$GITHUB_ENV"
-
-      - name: Prepare changelog
-        env:
-          VERSION_CODE: ${{ env.VERSION_CODE }}
-        run: |
-          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/$VERSION_CODE.txt"
-          if [ -f "$CHANGELOG_FILE" ]; then
-            cp "$CHANGELOG_FILE" "__changelog_file__";
-            sed -Ei 's/^([a-zA-Z0-9 ]+):$/### \1/g' "__changelog_file__";
-            sed -i 's/•/-/g' "__changelog_file__";
-          else
-            echo "Did not find changelog file";
-            touch "__changelog_file__";
-          fi;
-
-      - name: Extract apksigner paths
-        run: |
-          BUILD_TOOLS_PATH="$("$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed | grep build-tools/ | tail -n 1 | sed -nE 's~^.*(build-tools/[^ \t]+).*$~\1~p')"
-          echo "APKSIGNER=$ANDROID_HOME/$BUILD_TOOLS_PATH/apksigner" >> $GITHUB_ENV
-
-      - name: Print some information
-        env:
-          VERSION: ${{ env.VERSION }}
-          VERSION_CODE: ${{ env.VERSION_CODE }}
-          APKSIGNER: ${{ env.APKSIGNER }}
-        run: |
-          echo "Version: $VERSION" >> "$GITHUB_STEP_SUMMARY"
-          echo "Version code: $VERSION_CODE" >> "$GITHUB_STEP_SUMMARY"
-          echo "Build directory: $BUILD_DIR" >> "$GITHUB_STEP_SUMMARY"
-          echo "Android home: $ANDROID_HOME" >> "$GITHUB_STEP_SUMMARY"
-          echo "Chosen apksigner: $APKSIGNER" >> "$GITHUB_STEP_SUMMARY"
-          echo "Available Android build-tools:" "$(ls "$ANDROID_HOME/build-tools/" | xargs)" >> "$GITHUB_STEP_SUMMARY"
-          echo >> "$GITHUB_STEP_SUMMARY"
-          echo "Changelog:" >> "$GITHUB_STEP_SUMMARY"
-          cat "__changelog_file__" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build release APK
-        run: ./gradlew assembleRelease --stacktrace
-
-      - name: Move APK to folder for upload
-        env:
-          VERSION: ${{ env.VERSION }}
-        run: |
-          mkdir apks
-          mv "app/build/outputs/apk/release/app-release-unsigned.apk" "./apks/Dicio_${VERSION}.apk"
-
-      - name: Sign APKs
+      - name: Validate required signing secrets
+        if: ${{ inputs.publish_signed_release }}
         env:
           KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
           KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$KEYSTORE_BASE64" ]] || missing+=("SIGNING_KEYSTORE_BASE64")
+          [[ -n "$KEY_ALIAS" ]] || missing+=("SIGNING_KEY_ALIAS")
+          [[ -n "$KEYSTORE_PASSWORD" ]] || missing+=("SIGNING_KEYSTORE_PASSWORD")
+
+          if (( ${#missing[@]} > 0 )); then
+            joined="$(IFS=', '; echo "${missing[*]}")"
+            echo "::error::Cannot publish a signed release. Missing GitHub Actions secrets: $joined"
+            echo "Run this workflow with 'publish_signed_release' disabled to build an unsigned APK artifact."
+            exit 1
+          fi
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+          cache: gradle
+
+      - name: Validate signing keystore
+        if: ${{ inputs.publish_signed_release }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          chmod 600 keystore.jks
+
+          if [[ ! -s keystore.jks ]]; then
+            echo "::error::SIGNING_KEYSTORE_BASE64 decoded to an empty keystore."
+            exit 1
+          fi
+
+          if ! keytool -list \
+            -keystore keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::The signing keystore, password, or alias is invalid."
+            exit 1
+          fi
+
+      - name: Extract version and version code
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's~versionName ?= ?\"(.*)\"~\1~p' app/build.gradle.kts | tr -d ' ')"
+          VERSION_CODE="$(sed -nE 's~versionCode ?= ?(.*)~\1~p' app/build.gradle.kts | tr -d ' ')"
+
+          if [[ -z "$VERSION" || -z "$VERSION_CODE" ]]; then
+            echo "::error::Could not extract versionName/versionCode from app/build.gradle.kts"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+      - name: Prepare changelog
+        env:
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/$VERSION_CODE.txt"
+          if [[ -f "$CHANGELOG_FILE" ]]; then
+            cp "$CHANGELOG_FILE" __changelog_file__
+            sed -Ei 's/^([a-zA-Z0-9 ]+):$/### \1/g' __changelog_file__
+            sed -i 's/•/-/g' __changelog_file__
+          else
+            echo "Did not find changelog file: $CHANGELOG_FILE"
+            : > __changelog_file__
+          fi
+
+      - name: Locate apksigner
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS_VERSION="$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          if [[ ! -x "$APKSIGNER" ]]; then
+            echo "::error::Could not find an executable apksigner at $APKSIGNER"
+            exit 1
+          fi
+          echo "APKSIGNER=$APKSIGNER" >> "$GITHUB_ENV"
+
+      - name: Print build information
+        env:
+          VERSION: ${{ env.VERSION }}
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+          APKSIGNER: ${{ env.APKSIGNER }}
+          PUBLISH_SIGNED_RELEASE: ${{ inputs.publish_signed_release }}
+        shell: bash
+        run: |
+          {
+            echo "Version: $VERSION"
+            echo "Version code: $VERSION_CODE"
+            echo "Android home: $ANDROID_HOME"
+            echo "Chosen apksigner: $APKSIGNER"
+            echo "Publish signed release: $PUBLISH_SIGNED_RELEASE"
+            echo
+            echo "Changelog:"
+            cat __changelog_file__
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Prepare APK artifact
+        env:
+          VERSION: ${{ env.VERSION }}
+          PUBLISH_SIGNED_RELEASE: ${{ inputs.publish_signed_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apks
+          if [[ "$PUBLISH_SIGNED_RELEASE" == "true" ]]; then
+            mv app/build/outputs/apk/release/app-release-unsigned.apk "apks/Dicio_${VERSION}.apk"
+          else
+            mv app/build/outputs/apk/release/app-release-unsigned.apk "apks/Dicio_${VERSION}-unsigned.apk"
+          fi
+
+      - name: Sign and verify APK
+        if: ${{ inputs.publish_signed_release }}
+        env:
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
           VERSION: ${{ env.VERSION }}
           APKSIGNER: ${{ env.APKSIGNER }}
+        shell: bash
         run: |
-          openssl base64 -A -d -out keystore.jks <<< "$KEYSTORE_BASE64"
-          "$APKSIGNER" sign --ks ./keystore.jks --ks-key-alias "$KEY_ALIAS" --ks-pass "pass:$KEYSTORE_PASSWORD" "./apks/Dicio_${VERSION}.apk"
+          set -euo pipefail
+          trap 'rm -f keystore.jks' EXIT
+          APK="apks/Dicio_${VERSION}.apk"
 
-      - name: Upload artifacts
+          "$APKSIGNER" sign \
+            --ks keystore.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            "$APK"
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+      - name: Record APK checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum apks/*.apk | tee apk-sha256.txt
+          {
+            echo
+            echo "APK SHA-256:"
+            echo '```'
+            cat apk-sha256.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v6
         with:
-          name: apks
-          path: apks
+          name: apk-${{ env.VERSION }}
+          path: |
+            apks/*.apk
+            apk-sha256.txt
+          if-no-files-found: error
 
-      - name: Make sure not to overwrite the APKs of a release that was already released
-        id: get_release
-        uses: joutvhu/get-release@v1
-        with:
-          tag_name: v${{ env.VERSION }}
+      - name: Refuse to overwrite a published release
+        if: ${{ inputs.publish_signed_release }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ env.VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if draft="$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$draft" != "true" ]]; then
+              echo "::error::Release v${VERSION} already exists and is published; refusing to overwrite it."
+              exit 1
+            fi
+          fi
 
-      - name: Create draft release
-        id: create_release
-        # if the release exists and is a draft, or the release does not exists,
-        # proceed with uploading/overwriting artifacts
-        if: ${{ (steps.get_release.outputs.draft == 'true') || (steps.get_release.outputs.draft == '') }}
-        uses: softprops/action-gh-release@v1
+      - name: Create or update draft release
+        if: ${{ inputs.publish_signed_release }}
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
           name: v${{ env.VERSION }}
@@ -103,3 +220,4 @@ jobs:
           draft: true
           files: |
             apks/Dicio_${{ env.VERSION }}.apk
+            apk-sha256.txt
