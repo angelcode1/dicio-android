@@ -1,12 +1,14 @@
 name: Build APK / create release
 
+run-name: ${{ inputs.publish_signed_release && 'Create signed APK release' || 'Build unsigned APK artifact' }}
+
 on:
   workflow_dispatch:
     inputs:
       publish_signed_release:
-        description: Sign the APK and create/update the draft GitHub release (requires SIGNING_* secrets)
+        description: Create/update the signed draft GitHub release. Uncheck only for an unsigned Actions artifact.
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -37,7 +39,8 @@ jobs:
           if (( ${#missing[@]} > 0 )); then
             joined="$(IFS=', '; echo "${missing[*]}")"
             echo "::error::Cannot publish a signed release. Missing GitHub Actions secrets: $joined"
-            echo "Run this workflow with 'publish_signed_release' disabled to build an unsigned APK artifact."
+            echo "Add the SIGNING_* repository secrets, then rerun this workflow."
+            echo "Only disable 'publish_signed_release' when you intentionally want an unsigned Actions artifact and no GitHub release."
             exit 1
           fi
 
