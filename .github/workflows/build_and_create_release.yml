@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_signed_release:
-        description: Create/update the signed draft GitHub release. Uncheck only for an unsigned Actions artifact.
+        description: Create the signed, published GitHub release. Uncheck only for an unsigned Actions artifact.
         required: false
         default: true
         type: boolean
@@ -213,14 +213,14 @@ jobs:
             fi
           fi
 
-      - name: Create or update draft release
+      - name: Create or publish release
         if: ${{ inputs.publish_signed_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
           name: v${{ env.VERSION }}
           body_path: __changelog_file__
-          draft: true
+          draft: false
           files: |
             apks/Dicio_${{ env.VERSION }}.apk
             apk-sha256.txt
