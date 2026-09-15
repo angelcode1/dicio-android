@@ -163,8 +163,8 @@ dependencies {
     implementation(libs.kotlin.serialization)
     implementation(libs.navigation)
 
+    // Model files are downloaded directly on first use, avoiding on-device tar.bz2 extraction.
     implementation("com.k2fsa:sherpa-onnx:1.13.2@aar")
-    implementation("org.apache.commons:commons-compress:1.28.0")
 
     implementation(libs.litert)
 
