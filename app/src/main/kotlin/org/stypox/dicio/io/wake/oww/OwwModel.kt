@@ -1,22 +1,38 @@
 package org.stypox.dicio.io.wake.oww
 
-import org.tensorflow.lite.Interpreter
 import java.io.File
+import org.tensorflow.lite.Interpreter
 
 class OwwModel(
     melSpectrogramPath: File,
     embeddingPath: File,
-    wakeWordPath: File
+    wakeWordPath: File,
 ) : AutoCloseable {
     @Suppress("JoinDeclarationAndAssignment")
     private val melInterpreter: Interpreter
     private val embInterpreter: Interpreter
     private val wakeInterpreter: Interpreter
 
-    private var accumulatedMelOutputs: Array<Array<FloatArray>> = Array(EMB_INPUT_COUNT) { arrayOf() }
-    private var accumulatedEmbOutputs: Array<FloatArray> = Array(WAKE_INPUT_COUNT) { floatArrayOf() }
+    // All inference buffers are reused. This path runs continuously (about every 72 ms), so even
+    // small per-frame object graphs create significant GC/battery pressure over time.
+    private val melInput = arrayOf(FloatArray(0))
+    private val melOutput = Array(MEL_OUTPUT_COUNT) { FloatArray(MEL_FEATURE_SIZE) }
+    private val melOutputTensor = arrayOf(arrayOf(melOutput))
 
-    private var isClosed: Boolean = false // whether the model has just been closed
+    private val accumulatedMelOutputs =
+        Array(EMB_INPUT_COUNT) { Array(MEL_FEATURE_SIZE) { FloatArray(1) } }
+    private val embInputTensor = arrayOf(accumulatedMelOutputs)
+    private val embOutput = Array(EMB_OUTPUT_COUNT) { FloatArray(EMB_FEATURE_SIZE) }
+    private val embOutputTensor = arrayOf(arrayOf(embOutput))
+
+    private val accumulatedEmbOutputs = Array(WAKE_INPUT_COUNT) { FloatArray(EMB_FEATURE_SIZE) }
+    private val wakeInputTensor = arrayOf(accumulatedEmbOutputs)
+    private val wakeOutput = FloatArray(1)
+    private val wakeOutputTensor = arrayOf(wakeOutput)
+
+    private var accumulatedMelCount = 0
+    private var accumulatedEmbCount = 0
+    private var isClosed = false
 
     init {
         melInterpreter = loadModel(melSpectrogramPath, intArrayOf(1, MEL_INPUT_COUNT))
@@ -39,57 +55,70 @@ class OwwModel(
 
     fun processFrame(audio: FloatArray): Float {
         synchronized(this) {
-            if (isClosed) {
-                // there must have been a synchronization error, don't do anything
-                return 0.0f
-            }
-
+            if (isClosed) return 0.0f
             if (audio.size != MEL_INPUT_COUNT) {
                 throw IllegalArgumentException(
                     "OwwModel can only process audio frames of $MEL_INPUT_COUNT samples"
                 )
             }
 
-            val melOutput = Array(MEL_OUTPUT_COUNT) { FloatArray(MEL_FEATURE_SIZE) }
-            melInterpreter.run(arrayOf(audio), arrayOf(arrayOf(melOutput)))
-            for (i in 0..<EMB_INPUT_COUNT) {
-                accumulatedMelOutputs[i] = if (i < EMB_INPUT_COUNT - MEL_OUTPUT_COUNT) {
-                    accumulatedMelOutputs[i + MEL_OUTPUT_COUNT]
-                } else {
-                    melOutput[i - EMB_INPUT_COUNT + MEL_OUTPUT_COUNT]
-                        .map { floatArrayOf((it / 10.0f) + 2.0f) }
-                        .toTypedArray()
+            melInput[0] = audio
+            melInterpreter.run(melInput, melOutputTensor)
+
+            // Shift the rolling mel window in place, then append normalized new rows. Copying
+            // primitive values is cheaper than allocating ~160 FloatArray objects every frame.
+            for (i in 0 until EMB_INPUT_COUNT - MEL_OUTPUT_COUNT) {
+                for (feature in 0 until MEL_FEATURE_SIZE) {
+                    accumulatedMelOutputs[i][feature][0] =
+                        accumulatedMelOutputs[i + MEL_OUTPUT_COUNT][feature][0]
                 }
             }
-            //println("melOutput[0]=${melOutput[0][0]}")
-            if (accumulatedMelOutputs[0].isEmpty()) {
-                return 0.0f // not fully initialized yet
-            }
-
-            val embOutput = Array(EMB_OUTPUT_COUNT) { FloatArray(EMB_FEATURE_SIZE) }
-            embInterpreter.run(arrayOf(accumulatedMelOutputs), arrayOf(arrayOf(embOutput)))
-            for (i in 0..<WAKE_INPUT_COUNT) {
-                accumulatedEmbOutputs[i] = if (i < WAKE_INPUT_COUNT - EMB_OUTPUT_COUNT) {
-                    accumulatedEmbOutputs[i + EMB_OUTPUT_COUNT]
-                } else {
-                    @Suppress("KotlinConstantConditions")
-                    embOutput[i - WAKE_INPUT_COUNT + EMB_OUTPUT_COUNT]
+            for (i in 0 until MEL_OUTPUT_COUNT) {
+                val destination = EMB_INPUT_COUNT - MEL_OUTPUT_COUNT + i
+                for (feature in 0 until MEL_FEATURE_SIZE) {
+                    accumulatedMelOutputs[destination][feature][0] =
+                        (melOutput[i][feature] / 10.0f) + 2.0f
                 }
             }
-            //println("embOutput[0]=${embOutput[0][0]}")
-            if (accumulatedEmbOutputs[0].isEmpty()) {
-                return 0.0f // not fully initialized yet
-            }
+            accumulatedMelCount = minOf(
+                EMB_INPUT_COUNT,
+                accumulatedMelCount + MEL_OUTPUT_COUNT,
+            )
+            if (accumulatedMelCount < EMB_INPUT_COUNT) return 0.0f
 
-            val wakeOutput = FloatArray(1)
-            wakeInterpreter.run(arrayOf(accumulatedEmbOutputs), arrayOf(wakeOutput))
+            embInterpreter.run(embInputTensor, embOutputTensor)
+            for (i in 0 until WAKE_INPUT_COUNT - EMB_OUTPUT_COUNT) {
+                System.arraycopy(
+                    accumulatedEmbOutputs[i + EMB_OUTPUT_COUNT],
+                    0,
+                    accumulatedEmbOutputs[i],
+                    0,
+                    EMB_FEATURE_SIZE,
+                )
+            }
+            for (i in 0 until EMB_OUTPUT_COUNT) {
+                System.arraycopy(
+                    embOutput[i],
+                    0,
+                    accumulatedEmbOutputs[WAKE_INPUT_COUNT - EMB_OUTPUT_COUNT + i],
+                    0,
+                    EMB_FEATURE_SIZE,
+                )
+            }
+            accumulatedEmbCount = minOf(
+                WAKE_INPUT_COUNT,
+                accumulatedEmbCount + EMB_OUTPUT_COUNT,
+            )
+            if (accumulatedEmbCount < WAKE_INPUT_COUNT) return 0.0f
+
+            wakeInterpreter.run(wakeInputTensor, wakeOutputTensor)
             return wakeOutput[0]
         }
     }
 
-
     override fun close() {
         synchronized(this) {
+            if (isClosed) return
             isClosed = true
             melInterpreter.close()
             embInterpreter.close()
@@ -123,4 +152,3 @@ class OwwModel(
         }
     }
 }
-
