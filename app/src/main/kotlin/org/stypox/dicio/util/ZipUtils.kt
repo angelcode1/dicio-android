@@ -26,8 +26,8 @@ suspend fun extractZip(
     sourceZip: File,
     destinationDirectory: File,
     progressCallback: (Progress) -> Unit,
-) {
-    withContext(Dispatchers.IO) { ZipFile(sourceZip) }.use { zipFile ->
+) = withContext(Dispatchers.IO) {
+    ZipFile(sourceZip).use { zipFile ->
         var currentCount = 0
         var totalCount = 0
         for (entry in zipFile.entries()) {
@@ -35,14 +35,10 @@ suspend fun extractZip(
         }
 
         for (entry in zipFile.entries()) {
-            val destinationFile = withContext(Dispatchers.IO) {
-                getDestinationFile(destinationDirectory, entry.name)
-            }
+            val destinationFile = getDestinationFile(destinationDirectory, entry.name)
 
             if (entry.isDirectory) {
-                if (withContext(Dispatchers.IO) {
-                        !destinationFile.exists() && !destinationFile.mkdirs()
-                    }) {
+                if (!destinationFile.exists() && !destinationFile.mkdirs()) {
                     throw IOException("mkdirs failed: $destinationFile")
                 }
                 continue
@@ -50,11 +46,9 @@ suspend fun extractZip(
 
             // Valid ZIPs do not have to contain explicit directory entries. Always ensure a file's
             // parent exists before opening its output stream.
-            withContext(Dispatchers.IO) {
-                destinationFile.parentFile?.let { parent ->
-                    if (!parent.exists() && !parent.mkdirs()) {
-                        throw IOException("mkdirs failed: $parent")
-                    }
+            destinationFile.parentFile?.let { parent ->
+                if (!parent.exists() && !parent.mkdirs()) {
+                    throw IOException("mkdirs failed: $parent")
                 }
             }
 
