@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresApi
@@ -26,12 +27,14 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.ContextCompat.getSystemService
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.IOException
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
@@ -47,6 +50,10 @@ class WakeService : Service() {
 
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Default + job)
+    private val audioDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "DicioWakeAudio")
+    }.asCoroutineDispatcher()
+    private val audioScope = CoroutineScope(audioDispatcher + job)
     private val listening = AtomicBoolean(false)
 
     @Inject lateinit var skillEvaluator: SkillEvaluator
@@ -68,7 +75,8 @@ class WakeService : Service() {
         super.onCreate()
         notificationManager = getSystemService(this, NotificationManager::class.java)!!
 
-        scope.launch {
+        // Foreground-service promotion/notification updates belong on the service's main thread.
+        scope.launch(Dispatchers.Main.immediate) {
             wakeDevice.isHeyDicio.drop(1).collect { isHeyDicio ->
                 createForegroundNotification(isHeyDicio)
             }
@@ -78,6 +86,7 @@ class WakeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_WAKE_SERVICE) {
             listening.set(false)
+            stopWithMessage()
             return START_NOT_STICKY
         }
 
@@ -105,7 +114,7 @@ class WakeService : Service() {
             }
         }
 
-        scope.launch {
+        audioScope.launch {
             try {
                 listenForWakeWord()
                 stopWithMessage()
@@ -121,11 +130,13 @@ class WakeService : Service() {
         listening.set(false)
         handler.removeCallbacks(releaseSttResourcesRunnable)
         job.cancel()
+        audioDispatcher.close()
         wakeDevice.reinitializeToReleaseResources()
         super.onDestroy()
     }
 
     private fun stopWithMessage(message: String = "", throwable: Throwable? = null) {
+        listening.set(false)
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
 
@@ -187,7 +198,7 @@ class WakeService : Service() {
         if (minBufferBytes <= 0) {
             throw IllegalStateException("Unsupported 16 kHz mono microphone configuration")
         }
-        return AudioRecord.Builder()
+        val recorder = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -198,9 +209,16 @@ class WakeService : Service() {
             )
             .setBufferSizeInBytes(maxOf(minBufferBytes, wakeDevice.frameSize() * 2 * 2))
             .build()
+
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.release()
+            throw IOException("AudioRecord failed to initialize")
+        }
+        return recorder
     }
 
-    private fun readFullFrame(recorder: AudioRecord, audio: ShortArray) {
+    @Throws(IOException::class, DeadAudioRecordException::class)
+    private fun readFullFrame(recorder: AudioRecord, audio: ShortArray): Boolean {
         var offset = 0
         while (offset < audio.size && listening.get()) {
             val read = recorder.read(
@@ -209,26 +227,52 @@ class WakeService : Service() {
                 audio.size - offset,
                 AudioRecord.READ_BLOCKING,
             )
-            if (read < 0) throw IOException("AudioRecord.read failed with code $read")
-            if (read == 0) continue
-            offset += read
+            when {
+                read == AudioRecord.ERROR_DEAD_OBJECT -> throw DeadAudioRecordException()
+                read < 0 -> throw IOException("AudioRecord.read failed with code $read")
+                read == 0 -> continue
+                else -> offset += read
+            }
         }
-        if (offset != audio.size) throw IOException("Wake-word audio capture stopped mid-frame")
+        return offset == audio.size
+    }
+
+    private fun releaseAudioRecord(recorder: AudioRecord?) {
+        if (recorder == null) return
+        try {
+            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
+        } catch (_: IllegalStateException) {
+            // The recorder may already have failed/stopped.
+        }
+        recorder.release()
     }
 
     private fun listenForWakeWord() {
-        val recorder = createAudioRecord()
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+        var recorder: AudioRecord? = null
         var audio = ShortArray(0)
         var nextWakeWordAllowed = 0L
 
         try {
-            recorder.startRecording()
             while (listening.get()) {
+                if (recorder == null) {
+                    recorder = createAudioRecord().also { it.startRecording() }
+                }
+
                 val frameSize = wakeDevice.frameSize()
                 if (frameSize <= 0) throw IOException("Wake-word device has no valid frame size")
                 if (audio.size != frameSize) audio = ShortArray(frameSize)
 
-                readFullFrame(recorder, audio)
+                try {
+                    if (!readFullFrame(recorder, audio)) break
+                } catch (_: DeadAudioRecordException) {
+                    Log.w(TAG, "AudioRecord died; recreating microphone capture")
+                    releaseAudioRecord(recorder)
+                    recorder = null
+                    SystemClock.sleep(AUDIO_RECORD_RECREATE_BACKOFF_MILLIS)
+                    continue
+                }
 
                 val now = SystemClock.elapsedRealtime()
                 val wakeWordDetected = wakeDevice.processFrame(audio)
@@ -240,12 +284,7 @@ class WakeService : Service() {
                 lastHeardElapsedRealtime.set(now)
             }
         } finally {
-            try {
-                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
-            } catch (_: IllegalStateException) {
-                // The recorder may already have failed/stopped.
-            }
-            recorder.release()
+            releaseAudioRecord(recorder)
         }
     }
 
@@ -295,6 +334,8 @@ class WakeService : Service() {
             notificationManager.notify(TRIGGERED_NOTIFICATION_ID, notification)
         }
     }
+
+    private class DeadAudioRecordException : IOException("AudioRecord is no longer valid")
 
     companion object {
         @RequiresApi(Build.VERSION_CODES.R)
@@ -377,6 +418,7 @@ class WakeService : Service() {
         private const val START_NOTIFICATION_ID = 48019274
         private const val TRIGGERED_NOTIFICATION_ID = 601398647
         private const val WAKE_WORD_BACKOFF_MILLIS = 4000L
+        private const val AUDIO_RECORD_RECREATE_BACKOFF_MILLIS = 100L
         private const val ACTION_STOP_WAKE_SERVICE =
             "org.stypox.dicio.io.wake.WakeService.ACTION_STOP"
         private const val RELEASE_STT_RESOURCES_MILLIS = 1000L * 60 * 5
