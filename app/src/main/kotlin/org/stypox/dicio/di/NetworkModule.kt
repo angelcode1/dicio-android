@@ -11,7 +11,6 @@ import okhttp3.OkHttpClient
 private const val CONNECT_TIMEOUT_SECONDS = 15L
 private const val READ_TIMEOUT_SECONDS = 30L
 private const val WRITE_TIMEOUT_SECONDS = 30L
-private const val CALL_TIMEOUT_SECONDS = 45L
 
 /** Shared by Hilt-injected components and legacy static network helpers. */
 val sharedOkHttpClient: OkHttpClient by lazy {
@@ -19,7 +18,6 @@ val sharedOkHttpClient: OkHttpClient by lazy {
         .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .writeTimeout(WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 }
 
