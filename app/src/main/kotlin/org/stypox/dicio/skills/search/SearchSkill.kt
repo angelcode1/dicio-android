@@ -1,6 +1,8 @@
 package org.stypox.dicio.skills.search
 
 import androidx.core.net.toUri
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.dicio.skill.context.SkillContext
 import org.dicio.skill.skill.SkillInfo
 import org.dicio.skill.skill.SkillOutput
@@ -22,7 +24,9 @@ class SearchSkill(
 ) : StandardRecognizerSkill<Search>(correspondingSkillInfo, data, specificity) {
     override suspend fun generateOutput(ctx: SkillContext, inputData: Search): SkillOutput {
         val query = when (inputData) { is Search.Query -> inputData.what }
-        return searchOnDuckDuckGo(ctx, query, askAgainIfNoResult)
+        return withContext(Dispatchers.IO) {
+            searchOnDuckDuckGo(ctx, query, askAgainIfNoResult)
+        }
     }
 }
 
