@@ -6,6 +6,9 @@ import android.util.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +25,7 @@ import org.stypox.dicio.io.wake.WakeState
 import org.stypox.dicio.ui.util.Progress
 import org.stypox.dicio.util.FileToDownload
 import org.stypox.dicio.util.downloadBinaryFilesWithPartial
+import org.tensorflow.lite.Interpreter
 
 class OpenWakeWordDevice(
     @param:ApplicationContext private val appContext: Context,
@@ -36,12 +40,11 @@ class OpenWakeWordDevice(
     private val embFile = FileToDownload(EMB_URL, File(owwFolder, "embedding.tflite"))
     private val wakeFile = FileToDownload(WAKE_URL, File(owwFolder, "wake.tflite"))
     private val userWakeFile = userWakeFile(appContext)
-    private val userWakeFileExists = userWakeFile.exists()
-    private val allModelFiles =
-        if (userWakeFileExists) listOf(melFile, embFile)
-        else listOf(melFile, embFile, wakeFile)
+    private val allModelFiles: List<FileToDownload>
+        get() = if (userWakeFile.isFile) listOf(melFile, embFile) else listOf(melFile, embFile, wakeFile)
 
     private val audio = FloatArray(OwwModel.MEL_INPUT_COUNT)
+    private val modelLock = Any()
     private var model: OwwModel? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -84,53 +87,60 @@ class OpenWakeWordDevice(
     }
 
     override fun processFrame(audio16bitPcm: ShortArray): Boolean {
-        if (destroyed.get()) throw IOException("Wake word device has been destroyed")
         if (audio16bitPcm.size != OwwModel.MEL_INPUT_COUNT) {
             throw IllegalArgumentException(
                 "OwwModel can only process audio frames of ${OwwModel.MEL_INPUT_COUNT} samples"
             )
         }
 
-        if (model == null) {
-            if (_state.value.let { it != WakeState.NotLoaded && it !is WakeState.ErrorLoading }) {
-                throw IOException("Model has not been downloaded yet")
+        return synchronized(modelLock) {
+            if (destroyed.get()) throw IOException("Wake word device has been destroyed")
+
+            var activeModel = model
+            if (activeModel == null) {
+                if (_state.value.let { it != WakeState.NotLoaded && it !is WakeState.ErrorLoading }) {
+                    throw IOException("Model has not been downloaded yet")
+                }
+
+                try {
+                    _state.value = WakeState.Loading
+                    activeModel = OwwModel(
+                        melFile.file,
+                        embFile.file,
+                        if (userWakeFile.isFile) userWakeFile else wakeFile.file,
+                    )
+                    model = activeModel
+                    _state.value = WakeState.Loaded
+                } catch (throwable: Throwable) {
+                    Log.e(TAG, "Failed to load model", throwable)
+                    _state.value = WakeState.ErrorLoading(throwable)
+                    throw throwable
+                }
             }
 
-            try {
-                _state.value = WakeState.Loading
-                model = OwwModel(
-                    melFile.file,
-                    embFile.file,
-                    if (userWakeFileExists) userWakeFile else wakeFile.file,
-                )
-                _state.value = WakeState.Loaded
-            } catch (throwable: Throwable) {
-                Log.e(TAG, "Failed to load model", throwable)
-                _state.value = WakeState.ErrorLoading(throwable)
-                throw throwable
+            for (i in 0..<OwwModel.MEL_INPUT_COUNT) {
+                audio[i] = audio16bitPcm[i].toFloat() / 32768.0f
             }
-        }
 
-        for (i in 0..<OwwModel.MEL_INPUT_COUNT) {
-            audio[i] = audio16bitPcm[i].toFloat() / 32768.0f
+            activeModel!!.processFrame(audio) > 0.8f
         }
-
-        return model!!.processFrame(audio) > 0.8f
     }
 
     override fun frameSize(): Int = OwwModel.MEL_INPUT_COUNT
 
-    override fun isOccupyingResources(): Boolean = model != null
+    override fun isOccupyingResources(): Boolean = synchronized(modelLock) { model != null }
 
     override fun destroy() {
         if (!destroyed.compareAndSet(false, true)) return
         downloadJob?.cancel()
-        model?.close()
-        model = null
+        synchronized(modelLock) {
+            model?.close()
+            model = null
+        }
         scope.cancel()
     }
 
-    override fun isHeyDicio(): Boolean = !userWakeFileExists
+    override fun isHeyDicio(): Boolean = !userWakeFile.isFile
 
     companion object {
         val TAG = OpenWakeWordDevice::class.simpleName
@@ -147,20 +157,30 @@ class OpenWakeWordDevice(
                 val partialFile = File.createTempFile(userWakeFile.name, ".part", context.cacheDir)
                 try {
                     val inputStream = context.contentResolver.openInputStream(source)
-                    if (inputStream != null) {
-                        inputStream.use { input ->
-                            partialFile.outputStream().use { output -> input.copyTo(output) }
-                        }
+                        ?: throw IOException("Could not open custom wake model: $source")
+                    inputStream.use { input ->
+                        partialFile.outputStream().use { output -> input.copyTo(output) }
+                    }
 
-                        userWakeFile.parentFile?.mkdirs()
-                        if (userWakeFile.exists() && !userWakeFile.delete()) {
-                            throw IOException("Cannot replace existing wake model $userWakeFile")
+                    validateWakeModel(partialFile)
+                    userWakeFile.parentFile?.let { parent ->
+                        if (!parent.exists() && !parent.mkdirs()) {
+                            throw IOException("Could not create wake model directory $parent")
                         }
-                        if (!partialFile.renameTo(userWakeFile)) {
-                            throw IOException(
-                                "Cannot rename partial file $partialFile to actual file $userWakeFile"
-                            )
-                        }
+                    }
+                    try {
+                        Files.move(
+                            partialFile.toPath(),
+                            userWakeFile.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
+                    } catch (_: AtomicMoveNotSupportedException) {
+                        Files.move(
+                            partialFile.toPath(),
+                            userWakeFile.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
                     }
                 } finally {
                     partialFile.delete()
@@ -170,7 +190,36 @@ class OpenWakeWordDevice(
 
         suspend fun removeUserWakeFile(context: Context) {
             withContext(Dispatchers.IO) {
-                userWakeFile(context).delete()
+                val file = userWakeFile(context)
+                if (file.exists() && !file.delete()) {
+                    throw IOException("Could not remove custom wake model $file")
+                }
+            }
+        }
+
+        @Throws(IOException::class)
+        private fun validateWakeModel(file: File) {
+            val interpreter = try {
+                Interpreter(file)
+            } catch (throwable: Throwable) {
+                throw IOException("Custom wake model is not a valid TensorFlow Lite model", throwable)
+            }
+            try {
+                interpreter.allocateTensors()
+                val inputShape = interpreter.getInputTensor(0).shape()
+                val outputShape = interpreter.getOutputTensor(0).shape()
+                if (!inputShape.contentEquals(
+                        intArrayOf(1, OwwModel.WAKE_INPUT_COUNT, OwwModel.EMB_FEATURE_SIZE)
+                    ) || !outputShape.contentEquals(intArrayOf(1, 1))
+                ) {
+                    throw IOException(
+                        "Custom wake model has incompatible tensors: " +
+                            "input=${inputShape.contentToString()}, " +
+                            "output=${outputShape.contentToString()}"
+                    )
+                }
+            } finally {
+                interpreter.close()
             }
         }
     }
