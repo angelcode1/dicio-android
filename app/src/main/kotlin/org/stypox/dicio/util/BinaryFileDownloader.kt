@@ -47,7 +47,9 @@ suspend fun downloadBinaryFilesWithPartial(
         yield()
         progressCallback(Progress(i, filesNeedingDownload.size, 0, 0))
 
-        val response = httpClient.getResponse(fileToDownload.url)
+        val response = withContext(Dispatchers.IO) {
+            httpClient.getResponse(fileToDownload.url)
+        }
         downloadBinaryFileWithPartial(
             response = response,
             file = fileToDownload.file,
@@ -83,8 +85,10 @@ suspend fun downloadBinaryFileWithPartial(
     }
     try {
         response.use { successfulResponse ->
-            partialFile.outputStream().use { output ->
-                downloadBinaryFile(successfulResponse, output, progressCallback)
+            withContext(Dispatchers.IO) {
+                partialFile.outputStream().use { output ->
+                    downloadBinaryFile(successfulResponse, output, progressCallback)
+                }
             }
         }
 
@@ -124,12 +128,13 @@ suspend fun downloadBinaryFile(
         throw IOException("HTTP ${response.code} ${response.message}")
     }
     val responseBody = response.body ?: throw IOException("Response doesn't contain a file")
-    val totalBytes = responseBody.contentLength().takeIf { it >= 0L } ?: 0L
+    val expectedBytes = responseBody.contentLength()
+    val totalBytes = expectedBytes.takeIf { it >= 0L } ?: 0L
 
     progressCallback(0, totalBytes)
+    var currentBytes = 0L
     BufferedInputStream(responseBody.byteStream()).use { input ->
         val dataBuffer = ByteArray(CHUNK_SIZE)
-        var currentBytes = 0L
         while (true) {
             val readBytes = input.read(dataBuffer)
             if (readBytes == -1) break
@@ -139,6 +144,12 @@ suspend fun downloadBinaryFile(
             outputStream.write(dataBuffer, 0, readBytes)
             progressCallback(currentBytes, totalBytes)
         }
+    }
+
+    if (expectedBytes >= 0L && currentBytes != expectedBytes) {
+        throw IOException(
+            "Truncated download: expected $expectedBytes bytes but received $currentBytes bytes"
+        )
     }
 }
 
