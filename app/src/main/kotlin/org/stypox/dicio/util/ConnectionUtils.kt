@@ -1,27 +1,43 @@
 package org.stypox.dicio.util
 
 import android.net.Uri
-import org.json.JSONException
-import org.json.JSONObject
-import org.stypox.dicio.util.ConnectionUtils.percentEncode
+import java.io.FileNotFoundException
 import java.io.IOException
-import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
-import java.util.Scanner
+import java.util.concurrent.TimeUnit
+import okhttp3.Request
+import org.json.JSONException
+import org.json.JSONObject
+import org.stypox.dicio.di.sharedOkHttpClient
+import org.stypox.dicio.util.ConnectionUtils.percentEncode
+
+private const val SKILL_CALL_TIMEOUT_SECONDS = 45L
 
 object ConnectionUtils {
     @Throws(IOException::class)
     fun getPage(
         url: String,
-        headers: Map<String, String?>
+        headers: Map<String, String?>,
     ): String {
-        val connection = URL(url).openConnection()
-        for ((key, value) in headers) {
-            connection.setRequestProperty(key, value)
+        val request = Request.Builder()
+            .url(url)
+            .apply {
+                for ((key, value) in headers) {
+                    if (value != null) header(key, value)
+                }
+            }
+            .build()
+
+        val call = sharedOkHttpClient.newCall(request)
+        call.timeout().timeout(SKILL_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        return call.execute().use { response ->
+            if (!response.isSuccessful) {
+                if (response.code == 404) throw FileNotFoundException(url)
+                throw IOException("HTTP ${response.code} ${response.message} while requesting $url")
+            }
+            response.body?.string() ?: throw IOException("Response body is missing for $url")
         }
-        val scanner = Scanner(connection.getInputStream())
-        return scanner.useDelimiter("\\A").next()
     }
 
     @Throws(IOException::class)

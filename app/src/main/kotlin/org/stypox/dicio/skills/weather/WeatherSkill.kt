@@ -1,6 +1,11 @@
 package org.stypox.dicio.skills.weather
 
+import java.io.FileNotFoundException
+import java.util.Locale
+import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import org.dicio.skill.context.SkillContext
 import org.dicio.skill.skill.SkillInfo
 import org.dicio.skill.skill.SkillOutput
@@ -10,9 +15,6 @@ import org.stypox.dicio.sentences.Sentences.Weather
 import org.stypox.dicio.skills.weather.WeatherInfo.weatherDataStore
 import org.stypox.dicio.util.ConnectionUtils
 import org.stypox.dicio.util.StringUtils
-import java.io.FileNotFoundException
-import java.util.Locale
-import kotlin.math.roundToInt
 
 class WeatherSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerData<Weather>) :
     StandardRecognizerSkill<Weather>(correspondingSkillInfo, data) {
@@ -22,12 +24,14 @@ class WeatherSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerDa
         val city = getCity(prefs, inputData) ?: return WeatherOutput.Failed(city = "")
 
         val weatherData = try {
-            ConnectionUtils.getPageJson(
-                // always request in metric units (°C and m) and convert later
-                "$WEATHER_API_URL?APPID=$API_KEY&units=metric&lang=" +
+            withContext(Dispatchers.IO) {
+                ConnectionUtils.getPageJson(
+                    // always request in metric units (°C and m) and convert later
+                    "$WEATHER_API_URL?APPID=$API_KEY&units=metric&lang=" +
                         ctx.locale.language.lowercase(Locale.getDefault()) +
                         "&q=" + ConnectionUtils.urlEncode(city)
-            )
+                )
+            }
         } catch (_: FileNotFoundException) {
             return WeatherOutput.Failed(city = city)
         }
@@ -42,21 +46,21 @@ class WeatherSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerDa
         return WeatherOutput.Success(
             city = weatherData.getString("name"),
             description = weatherObject.getString("description")
-                .apply { this[0].uppercaseChar() + this.substring(1) },
+                .replaceFirstChar { it.uppercase() },
             iconUrl = ICON_BASE_URL + weatherObject.getString("icon") + ICON_FORMAT,
             temp = temp,
             tempMin = mainObject.getDouble("temp_min"),
             tempMax = mainObject.getDouble("temp_max"),
             tempString = ctx.parserFormatter
                 ?.niceNumber(tempConverted.roundToInt().toDouble())?.speech(true)?.get()
-                ?: (tempConverted.roundToInt().toString()),
+                ?: tempConverted.roundToInt().toString(),
             windSpeed = windObject.getDouble("speed"),
             temperatureUnit = tempUnit,
             lengthUnit = ResolvedLengthUnit.from(prefs),
         )
     }
 
-    private fun getCity(prefs: SkillSettingsWeather, inputData: Weather): String? {
+    private suspend fun getCity(prefs: SkillSettingsWeather, inputData: Weather): String? {
         var city = when (inputData) {
             is Weather.Current -> inputData.where
         }
@@ -66,7 +70,9 @@ class WeatherSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerDa
         }
 
         if (city.isEmpty()) {
-            city = ConnectionUtils.getPageJson(IP_INFO_URL).getString("city")
+            city = withContext(Dispatchers.IO) {
+                ConnectionUtils.getPageJson(IP_INFO_URL).getString("city")
+            }
         }
 
         if (city.isNullOrEmpty()) {

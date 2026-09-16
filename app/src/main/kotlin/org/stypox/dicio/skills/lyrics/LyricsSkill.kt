@@ -1,5 +1,8 @@
 package org.stypox.dicio.skills.lyrics
 
+import java.util.regex.Pattern
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.dicio.skill.context.SkillContext
 import org.dicio.skill.skill.SkillInfo
 import org.dicio.skill.skill.SkillOutput
@@ -14,10 +17,9 @@ import org.stypox.dicio.util.ConnectionUtils
 import org.stypox.dicio.util.RegexUtils
 import org.unbescape.javascript.JavaScriptEscape
 import org.unbescape.json.JsonEscape
-import java.util.regex.Pattern
 
-class LyricsSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerData<Lyrics>)
-    : StandardRecognizerSkill<Lyrics>(correspondingSkillInfo, data) {
+class LyricsSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerData<Lyrics>) :
+    StandardRecognizerSkill<Lyrics>(correspondingSkillInfo, data) {
 
     /**
      * This connects to Genius to get lyrics information.
@@ -27,9 +29,11 @@ class LyricsSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerDat
         val songName: String = when (inputData) {
             is Lyrics.Query -> inputData.song ?: return LyricsOutput.Failed(title = "")
         }
-        val search: JSONObject = ConnectionUtils.getPageJson(
-            GENIUS_SEARCH_URL + ConnectionUtils.urlEncode(songName) + "&count=1"
-        )
+        val search: JSONObject = withContext(Dispatchers.IO) {
+            ConnectionUtils.getPageJson(
+                GENIUS_SEARCH_URL + ConnectionUtils.urlEncode(songName) + "&count=1"
+            )
+        }
         val searchHits: JSONArray = search.getJSONObject("response").getJSONArray("sections")
             .getJSONObject(0).getJSONArray("hits")
         if (searchHits.length() == 0) {
@@ -37,9 +41,9 @@ class LyricsSkill(correspondingSkillInfo: SkillInfo, data: StandardRecognizerDat
         }
 
         val song: JSONObject = searchHits.getJSONObject(0).getJSONObject("result")
-        var lyricsHtml: String = ConnectionUtils.getPage(
-            GENIUS_LYRICS_URL + song.getInt("id") + "/embed.js"
-        )
+        var lyricsHtml: String = withContext(Dispatchers.IO) {
+            ConnectionUtils.getPage(GENIUS_LYRICS_URL + song.getInt("id") + "/embed.js")
+        }
         lyricsHtml = RegexUtils.matchGroup(LYRICS_PATTERN, lyricsHtml, 1)
         lyricsHtml = JsonEscape.unescapeJson(JavaScriptEscape.unescapeJavaScript(lyricsHtml))
         val lyricsDocument: Document = Jsoup.parse(lyricsHtml)
