@@ -5,11 +5,14 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 import okhttp3.Request
 import org.json.JSONException
 import org.json.JSONObject
 import org.stypox.dicio.di.sharedOkHttpClient
 import org.stypox.dicio.util.ConnectionUtils.percentEncode
+
+private const val SKILL_CALL_TIMEOUT_SECONDS = 45L
 
 object ConnectionUtils {
     @Throws(IOException::class)
@@ -26,7 +29,9 @@ object ConnectionUtils {
             }
             .build()
 
-        return sharedOkHttpClient.newCall(request).execute().use { response ->
+        val call = sharedOkHttpClient.newCall(request)
+        call.timeout().timeout(SKILL_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        return call.execute().use { response ->
             if (!response.isSuccessful) {
                 if (response.code == 404) throw FileNotFoundException(url)
                 throw IOException("HTTP ${response.code} ${response.message} while requesting $url")
