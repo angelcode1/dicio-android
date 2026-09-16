@@ -1,16 +1,21 @@
 package org.stypox.dicio.util
 
-import io.kotest.core.spec.style.StringSpec
 import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.core.spec.style.StringSpec
 import io.kotest.matchers.shouldBe
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.BufferedSource
+import okio.buffer
+import okio.source
 
 class BinaryFileDownloaderTest : StringSpec({
     "download marker is invalid when target file is missing" {
@@ -54,6 +59,24 @@ class BinaryFileDownloaderTest : StringSpec({
         }
     }
 
+    "truncated response with content length is rejected" {
+        val response = response(
+            code = 200,
+            message = "OK",
+            body = "short",
+            declaredLength = 100,
+        )
+        try {
+            shouldThrow<IOException> {
+                runBlocking {
+                    downloadBinaryFile(response, ByteArrayOutputStream()) { _, _ -> }
+                }
+            }
+        } finally {
+            response.close()
+        }
+    }
+
     "partial download installs complete file" {
         val root = Files.createTempDirectory("dicio-download-test").toFile()
         try {
@@ -71,15 +94,44 @@ class BinaryFileDownloaderTest : StringSpec({
             root.deleteRecursively()
         }
     }
+
+    "orphan partial cleanup preserves unrelated cache files" {
+        val root = Files.createTempDirectory("dicio-download-test").toFile()
+        try {
+            root.resolve("model.bin123.part").writeText("partial")
+            root.resolve("other.tmp").writeText("keep")
+
+            deletePartialFiles(root)
+
+            root.resolve("model.bin123.part").exists() shouldBe false
+            root.resolve("other.tmp").exists() shouldBe true
+        } finally {
+            root.deleteRecursively()
+        }
+    }
 }) {
     companion object {
-        private fun response(code: Int, message: String, body: String): Response {
+        private fun response(
+            code: Int,
+            message: String,
+            body: String,
+            declaredLength: Long? = null,
+        ): Response {
+            val responseBody = if (declaredLength == null) {
+                body.toResponseBody()
+            } else {
+                object : ResponseBody() {
+                    override fun contentType(): MediaType? = null
+                    override fun contentLength(): Long = declaredLength
+                    override fun source(): BufferedSource = body.byteInputStream().source().buffer()
+                }
+            }
             return Response.Builder()
                 .request(Request.Builder().url("https://example.test/model.bin").build())
                 .protocol(Protocol.HTTP_1_1)
                 .code(code)
                 .message(message)
-                .body(body.toResponseBody())
+                .body(responseBody)
                 .build()
         }
     }
